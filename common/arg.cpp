@@ -4534,6 +4534,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--moe-trace"}, "FNAME",
+        "write a JSONL trace of routed-expert selections per token and layer (moe-stream-lab M1; default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.moe_trace_file = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_TRACE"));
+    add_opt(common_arg(
         {"--tensor-filter"}, "REGEX",
         "filter tensor names for debug output (regex pattern, can be specified multiple times)",
         [](common_params & params, const std::string & value) {

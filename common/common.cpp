@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "moe-trace.h"
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -1546,6 +1547,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         res->reset_samplers();
     }
 
+    if (!params.moe_trace_file.empty()) {
+        common_moe_trace_set_enabled(true);
+    }
+
     return res;
 }
 
@@ -1742,6 +1747,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    if (!params.moe_trace_file.empty() && cparams.cb_eval == nullptr) {
+        void * ud = common_moe_trace_install(params.moe_trace_file);
+        if (ud) {
+            cparams.cb_eval           = common_moe_trace_cb_eval;
+            cparams.cb_eval_user_data = ud;
+        }
+    }
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
