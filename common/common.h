@@ -518,6 +518,7 @@ struct common_params {
 
     // llama-debug specific options
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
+    std::string moe_trace_file;             // moe-stream-lab: JSONL routing trace of selected experts       // NOLINT
     bool        save_logits       = false;  // whether to save logits to files                              // NOLINT
     std::vector<std::string> tensor_filter; // filter tensor names for debug output (regex)                 // NOLINT
 

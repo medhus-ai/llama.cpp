@@ -74,6 +74,8 @@ add_library(${TARGET}
     console.h
     debug.cpp
     debug.h
+    moe-trace.cpp
+    moe-trace.h
     download.cpp
     download.h
     fit.cpp
