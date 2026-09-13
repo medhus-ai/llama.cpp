@@ -8,6 +8,13 @@
 #include <cstring>
 #include <stdexcept>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#else
+#include <cstdio>
+#endif
+
 namespace moe {
 
 int ExpertIndex::layer_slot(uint32_t layer) const {
@@ -36,6 +43,77 @@ void MemoryExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, voi
         throw std::runtime_error("moe: slice out of bounds in " + s.name);
     }
     ggml_backend_tensor_get(s.source, dst, s.offset, s.bytes);
+}
+
+BufferedFileExpertStore::BufferedFileExpertStore(const std::string & path) : path_(path) {
+#ifndef _WIN32
+    fd_ = open(path.c_str(), O_RDONLY);
+    if (fd_ < 0) {
+        throw std::runtime_error("moe: cannot open model file for expert reads: " + path);
+    }
+#else
+    throw std::runtime_error("moe: BufferedFileExpertStore is implemented for POSIX only");
+#endif
+}
+
+BufferedFileExpertStore::~BufferedFileExpertStore() {
+#ifndef _WIN32
+    if (fd_ >= 0) {
+        close(fd_);
+    }
+#endif
+}
+
+void BufferedFileExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
+#ifndef _WIN32
+    const TensorSlice & s = e.slices.at(slice);
+    if (s.file_offset == 0) {
+        throw std::runtime_error("moe: no file offset recorded for " + s.name);
+    }
+    uint8_t * out = (uint8_t *) dst;
+    uint64_t  off = s.file_offset;
+    uint64_t  rem = s.bytes;
+    while (rem > 0) {
+        const ssize_t n = pread(fd_, out, (size_t) rem, (off_t) off);
+        if (n <= 0) {
+            throw std::runtime_error("moe: short read for " + s.name + " at offset " + std::to_string(off));
+        }
+        out += n;
+        off += (uint64_t) n;
+        rem -= (uint64_t) n;
+        reads_++;
+    }
+    bytes_ += s.bytes;
+#else
+    (void) e; (void) slice; (void) dst;
+    throw std::runtime_error("moe: BufferedFileExpertStore is implemented for POSIX only");
+#endif
+}
+
+VerifyingExpertStore::VerifyingExpertStore(std::unique_ptr<ExpertStore> primary, std::unique_ptr<ExpertStore> reference)
+    : primary_(std::move(primary)), reference_(std::move(reference)) {
+    name_ = std::string("verify(") + primary_->name() + " vs " + reference_->name() + ")";
+}
+
+void VerifyingExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
+    primary_->read_slice(e, slice, dst);
+
+    const TensorSlice & s = e.slices.at(slice);
+    ref_buf_.resize(s.bytes);
+    reference_->read_slice(e, slice, ref_buf_.data());
+
+    const uint8_t * a = (const uint8_t *) dst;
+    const uint8_t * b = ref_buf_.data();
+    for (uint64_t i = 0; i < s.bytes; ++i) {
+        if (a[i] != b[i]) {
+            throw std::runtime_error("moe: VERIFY FAILED for layer " + std::to_string(e.key.layer) +
+                                     " expert " + std::to_string(e.key.expert) + " tensor " + s.name +
+                                     " at byte " + std::to_string(i) + ": " + primary_->name() + " gave " +
+                                     std::to_string((int) a[i]) + ", " + reference_->name() + " gave " +
+                                     std::to_string((int) b[i]));
+        }
+    }
+    checked_++;
 }
 
 std::string PoolStats::json() const {

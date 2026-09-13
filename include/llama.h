@@ -325,6 +325,9 @@ extern "C" {
 
         // moe-stream-lab: serve routed experts from a compact pool of this many slots per MoE layer (0 = off)
         int32_t moe_pool_slots;
+        // moe-stream-lab: where routed expert bytes come from: 0 = resident tensors, 1 = model file
+        int32_t moe_store;
+        bool    moe_verify;   // moe-stream-lab: byte-compare every expert read against the resident tensors
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

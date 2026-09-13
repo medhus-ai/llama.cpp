@@ -3,6 +3,8 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 
+#include "gguf.h"
+
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
@@ -12,7 +14,8 @@
 
 static const char * SLOT_IDS_PREFIX = "ffn_moe_slot_ids-";
 
-llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_) : n_slots(n_slots_) {
+llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t store_mode, const std::string & model_path, bool verify)
+    : n_slots(n_slots_) {
     if (n_slots <= 0) {
         throw std::runtime_error("moe pool: n_slots must be > 0");
     }
@@ -67,6 +70,22 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_) : n_slots(
         throw std::runtime_error("moe pool: ggml_init failed");
     }
 
+    // When reading from the file, resolve every expert tensor's absolute offset from the GGUF metadata.
+    // The index stays model-independent: it only records byte ranges.
+    gguf_context * meta = nullptr;
+    uint64_t       meta_data_offset = 0;
+    if (store_mode == 1) {
+        if (model_path.empty()) {
+            throw std::runtime_error("moe pool: file store requested but the model path is unknown (split models are not supported yet)");
+        }
+        gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+        meta = gguf_init_from_file(model_path.c_str(), gp);
+        if (!meta) {
+            throw std::runtime_error("moe pool: cannot read GGUF metadata from " + model_path);
+        }
+        meta_data_offset = gguf_get_data_offset(meta);
+    }
+
     ggml_backend_buffer_type_t buft = nullptr;
     index_.descs.resize(index_.moe_layers.size() * n_expert);
 
@@ -113,6 +132,13 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_) : n_slots(
                 sl.bytes  = src->nb[2];
                 sl.offset = (uint64_t) e * src->nb[2];
                 sl.type   = src->type;
+                if (meta) {
+                    const int64_t ti = gguf_find_tensor(meta, sl.name.c_str());
+                    if (ti < 0) {
+                        throw std::runtime_error("moe pool: tensor not found in GGUF: " + sl.name);
+                    }
+                    sl.file_offset = meta_data_offset + gguf_get_tensor_offset(meta, ti) + sl.offset;
+                }
                 d.total_bytes += sl.bytes;
                 d.slices.push_back(std::move(sl));
             }
@@ -134,7 +160,21 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_) : n_slots(
     }
     ggml_backend_buffer_set_usage(buf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    store_ = std::make_unique<moe::MemoryExpertStore>();
+    if (meta) {
+        gguf_free(meta);
+    }
+
+    if (store_mode == 1) {
+        store_ = std::make_unique<moe::BufferedFileExpertStore>(model_path);
+    } else {
+        store_ = std::make_unique<moe::MemoryExpertStore>();
+    }
+    if (verify) {
+        if (store_mode == 0) {
+            throw std::runtime_error("moe pool: --moe-verify needs a non-reference store (use --moe-store file)");
+        }
+        store_ = std::make_unique<moe::VerifyingExpertStore>(std::move(store_), std::make_unique<moe::MemoryExpertStore>());
+    }
 
     const auto & d0 = index_.descs[0];
     fprintf(stderr, "moe pool: compact expert pool: %zu MoE layers x %d slots, %zu tensors/expert, %.2f MiB/expert, "

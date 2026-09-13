@@ -1695,6 +1695,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
     mparams.moe_pool_slots = params.moe_pool_slots;
+    mparams.moe_store      = params.moe_store;
+    mparams.moe_verify     = params.moe_verify;
     if (params.moe_pool_slots > 0 && !params.no_extra_bufts) {
         // moe-stream-lab: repacked expert weights live in a buffer type that cannot be read back
         // (no get_tensor), and the pool has to copy expert bytes out of them.
