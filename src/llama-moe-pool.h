@@ -10,8 +10,11 @@
 #include "moe-runtime/expert-runtime.h"
 
 #include <cstdint>
+#include <condition_variable>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -54,11 +57,18 @@ struct llama_moe_pool {
         std::vector<layer_t> layers;             // by index_.moe_layers order
         std::vector<float>   x;                  // scratch: [n_tok, n_embd]
         std::vector<float>   logits;             // scratch
-        uint64_t predictions = 0, issued = 0, demand_delayed = 0;
+        uint64_t predictions = 0, issued = 0, dropped = 0;   // dropped: queue was full, prediction discarded
+        // background queue: the callback only enqueues, never waits
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::vector<std::pair<uint32_t, uint32_t>> queue;   // (layer, expert)
+        bool stop = false;
+        std::vector<std::thread> threads;
     } prerouter_;
+    void prefetch_loop();
     void init_prerouter(llama_model & model, int k, int lookahead, const std::string & src_prefix);
     void on_residual(struct ggml_tensor * t, uint32_t block);
-    std::unique_ptr<moe::FetchWorkers> prefetch_workers_;
+
     bool    shared_ = false;
 
 private:
