@@ -349,6 +349,75 @@ int LayerPool::pick_victim() const {
     return best;  // -1 if everything is IN_USE or LOADING
 }
 
+FetchWorkers::FetchWorkers(uint32_t n_threads) {
+    for (uint32_t i = 0; i < n_threads; ++i) {
+        threads_.emplace_back([this]() { loop(); });
+    }
+}
+
+FetchWorkers::~FetchWorkers() {
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto & t : threads_) {
+        t.join();
+    }
+}
+
+void FetchWorkers::loop() {
+    uint64_t seen = 0;
+    for (;;) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        cv_.wait(lock, [&] { return stop_ || gen_ != seen; });
+        if (stop_) {
+            return;
+        }
+        seen = gen_;
+        for (;;) {
+            if (next_ >= n_) {
+                break;
+            }
+            const size_t i = next_++;
+            lock.unlock();
+            try {
+                (*fn_)(i);
+            } catch (...) {
+                lock.lock();
+                errors_.push_back(std::current_exception());
+                lock.unlock();
+            }
+            lock.lock();
+            done_++;
+        }
+        if (done_ == n_) {
+            done_cv_.notify_all();
+        }
+    }
+}
+
+void FetchWorkers::run(size_t n, const std::function<void(size_t)> & fn) {
+    std::unique_lock<std::mutex> lock(mtx_);
+    fn_ = &fn; n_ = n; next_ = 0; done_ = 0; errors_.clear(); gen_++;
+    cv_.notify_all();
+    done_cv_.wait(lock, [&] { return done_ == n_; });
+    fn_ = nullptr;
+    if (!errors_.empty()) {
+        std::exception_ptr e = errors_.front();
+        errors_.clear();
+        std::rethrow_exception(e);
+    }
+}
+
+void LayerPool::set_io_threads(uint32_t n) {
+    io_threads_ = n < 1 ? 1 : n;
+    workers_.reset();
+    if (io_threads_ > 1) {
+        workers_ = std::make_unique<FetchWorkers>(io_threads_);
+    }
+}
+
 // Read every slice of `d` into `staging` (contiguous, slice order). Safe on any thread.
 static void read_expert(ExpertStore & store, const ExpertDescriptor & d, std::vector<uint8_t> & staging) {
     staging.resize(d.total_bytes);
@@ -426,55 +495,36 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
         sl.generation++;
     }
 
-    std::atomic<size_t> next{0};
     std::atomic<uint64_t> bytes{0};
-    std::vector<std::exception_ptr> errors(n_threads);
     std::vector<std::vector<uint8_t>> staged(host_pool_ ? 0 : work.size());
-    std::vector<std::thread> workers;
-    workers.reserve(n_threads);
+    // one staging buffer per worker for host pools (workers write straight into the pool tensors)
+    std::vector<std::vector<uint8_t>> worker_buf(workers_ ? workers_->size() : 1);
+    std::atomic<uint32_t> buf_ticket{0};
+    thread_local int my_buf = -1;   // index into worker_buf, assigned on first use per worker thread
 
-    for (uint32_t t = 0; t < n_threads; ++t) {
-        workers.emplace_back([&, t]() {
-            std::vector<uint8_t> buf;
-            try {
-                for (;;) {
-                    const size_t i = next.fetch_add(1, std::memory_order_relaxed);
-                    if (i >= work.size()) {
-                        break;
-                    }
-                    const ExpertDescriptor & d = idx.get(work[i].first);
-                    const int slot = work[i].second;
-                    if (d.slices.size() != tensors_.size()) {
-                        throw std::runtime_error("moe: descriptor slice count != pool tensor count");
-                    }
-                    for (size_t k = 0; k < d.slices.size(); ++k) {
-                        if (d.slices[k].bytes != (uint64_t) tensors_[k]->nb[2]) {
-                            throw std::runtime_error("moe: slice bytes != pool slot bytes for " + d.slices[k].name);
-                        }
-                    }
-                    if (host_pool_) {
-                        // disjoint byte ranges of the same host tensors: workers may write directly
-                        fetch_into(store, d, slot, buf);
-                    } else {
-                        // device pool: workers only read from storage; the H2D copies are issued below
-                        // by the calling thread, in order, so the backend sees a single stream of sets
-                        read_expert(store, d, staged[i]);
-                    }
-                    bytes.fetch_add(d.total_bytes, std::memory_order_relaxed);
-                }
-            } catch (...) {
-                errors[t] = std::current_exception();
-            }
-        });
-    }
-    for (auto & w : workers) {
-        w.join();
-    }
-    for (auto & e : errors) {
-        if (e) {
-            std::rethrow_exception(e);   // no partial state is published: slots stay LOADING
+    auto task = [&](size_t i) {
+        const ExpertDescriptor & d = idx.get(work[i].first);
+        const int slot = work[i].second;
+        if (d.slices.size() != tensors_.size()) {
+            throw std::runtime_error("moe: descriptor slice count != pool tensor count");
         }
-    }
+        for (size_t k = 0; k < d.slices.size(); ++k) {
+            if (d.slices[k].bytes != (uint64_t) tensors_[k]->nb[2]) {
+                throw std::runtime_error("moe: slice bytes != pool slot bytes for " + d.slices[k].name);
+            }
+        }
+        if (host_pool_) {
+            if (my_buf < 0 || (size_t) my_buf >= worker_buf.size()) {
+                my_buf = (int) (buf_ticket.fetch_add(1) % worker_buf.size());
+            }
+            fetch_into(store, d, slot, worker_buf[my_buf]);
+        } else {
+            read_expert(store, d, staged[i]);
+        }
+        bytes.fetch_add(d.total_bytes, std::memory_order_relaxed);
+    };
+    // no partial state is published on error: slots stay LOADING and the exception propagates
+    workers_->run(work.size(), task);
 
     if (!host_pool_) {
         for (size_t i = 0; i < work.size(); ++i) {
