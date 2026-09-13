@@ -15,7 +15,7 @@
 
 static const char * SLOT_IDS_PREFIX = "ffn_moe_slot_ids-";
 
-llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads, const std::string & pack_path)
+llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads, const std::string & pack_path, uint64_t host_cache_bytes)
     : n_slots(n_slots_) {
     if (n_slots <= 0) {
         throw std::runtime_error("moe pool: n_slots must be > 0");
@@ -270,6 +270,11 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         case 3:  store_ = std::make_unique<moe::PackExpertStore>(pack_path);        break;
         default: throw std::runtime_error("moe pool: unknown store mode " + std::to_string(store_mode));
     }
+    if (host_cache_bytes > 0 && store_mode >= 1) {
+        auto cache = std::make_unique<moe::CachingExpertStore>(std::move(store_), host_cache_bytes);
+        host_cache_ = cache.get();
+        store_ = std::move(cache);
+    }
     if (verify) {
         if (store_mode == 0) {
             throw std::runtime_error("moe pool: --moe-verify needs a non-reference store (use --moe-store file, direct or pack)");
@@ -309,7 +314,20 @@ llama_moe_pool::~llama_moe_pool() {
 }
 
 std::string llama_moe_pool::stats_json() const {
-    return stats_.json();
+    std::string out = stats_.json();
+    if (host_cache_) {
+        const auto hs = host_cache_->stats();
+        char buf[320];
+        snprintf(buf, sizeof(buf),
+                 " host_cache: {\"capacity\": %llu, \"resident\": %llu, \"hits\": %llu, \"misses\": %llu, "
+                 "\"hit_rate\": %.4f, \"bytes_from_cache\": %llu, \"evictions\": %llu}",
+                 (unsigned long long) host_cache_->capacity(), (unsigned long long) host_cache_->resident_bytes(),
+                 (unsigned long long) hs.hits, (unsigned long long) hs.misses,
+                 (hs.hits + hs.misses) ? (double) hs.hits / (double) (hs.hits + hs.misses) : 0.0,
+                 (unsigned long long) hs.bytes_from_cache, (unsigned long long) hs.evictions);
+        out += buf;
+    }
+    return out;
 }
 
 static int parse_slot_ids_layer(const char * name) {

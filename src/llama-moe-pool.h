@@ -20,7 +20,7 @@ struct ggml_context;
 
 struct llama_moe_pool {
     // store_mode: 0 = resident tensors (memory), 1 = positional reads from the model file
-    llama_moe_pool(llama_model & model, int32_t n_slots, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads, const std::string & pack_path);
+    llama_moe_pool(llama_model & model, int32_t n_slots, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads, const std::string & pack_path, uint64_t host_cache_bytes);
     ~llama_moe_pool();
 
     llama_moe_pool(const llama_moe_pool &) = delete;
@@ -42,6 +42,7 @@ private:
 
     moe::ExpertIndex                             index_;
     std::unique_ptr<moe::ExpertStore>            store_;
+    moe::CachingExpertStore *                    host_cache_ = nullptr;   // non-owning view into store_ when enabled
     std::vector<std::unique_ptr<moe::LayerPool>> pools_;   // by index_.layer_slot(il), or one shared pool
     std::map<std::string, ggml_tensor *>         shared_tensors_;
     moe::PoolStats                               stats_;

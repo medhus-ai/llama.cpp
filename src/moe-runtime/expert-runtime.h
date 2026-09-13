@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <utility>
 #include <condition_variable>
@@ -155,6 +156,41 @@ public:
 private:
     std::unique_ptr<DirectIOExpertStore> inner_;
     bool direct_ = true;
+};
+
+// Host tier (moe-stream-lab ADR 0008): a bounded LRU of whole expert bundles in RAM in front of any store.
+// Reads are served from RAM when present; otherwise they go to the inner store and are written through.
+// Keyed by ExpertKey; capacity in bytes; thread-safe.
+class CachingExpertStore : public ExpertStore {
+public:
+    CachingExpertStore(std::unique_ptr<ExpertStore> inner, uint64_t capacity_bytes);
+
+    void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
+    const char * name() const override { return name_.c_str(); }
+
+    struct Stats { uint64_t hits = 0, misses = 0, bytes_from_cache = 0, bytes_inserted = 0, evictions = 0; };
+    Stats    stats() const;
+    uint64_t resident_bytes() const;
+    uint64_t capacity() const { return capacity_; }
+    ExpertStore & inner() { return *inner_; }
+
+private:
+    struct Entry {
+        std::vector<uint8_t> bytes;   // whole bundle, slices in descriptor order
+        uint64_t last_use = 0;
+    };
+    // look up / fill a whole bundle; returns a pointer valid while `mtx_` is held by the caller
+    const Entry * find_locked(ExpertKey k) const;
+    void insert_locked(ExpertKey k, std::vector<uint8_t> && bytes);
+
+    std::unique_ptr<ExpertStore> inner_;
+    uint64_t capacity_;
+    uint64_t used_ = 0;
+    uint64_t clock_ = 0;
+    std::map<std::pair<uint32_t, uint32_t>, Entry> map_;
+    mutable std::mutex mtx_;
+    Stats stats_;
+    std::string name_;
 };
 
 // Reads every slice through both stores and aborts on the first differing byte. Used by --moe-verify to
