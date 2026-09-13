@@ -4534,6 +4534,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--moe-pool-shared"},
+        "moe-stream-lab: share one expert pool across all MoE layers (--moe-pool-slots then counts total slots) instead of one pool per layer",
+        [](common_params & params) {
+            params.moe_pool_shared = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_POOL_SHARED"));
+    add_opt(common_arg(
         {"--moe-verify"},
         "moe-stream-lab: byte-compare every expert read against the resident tensors (slow, correctness only)",
         [](common_params & params) {

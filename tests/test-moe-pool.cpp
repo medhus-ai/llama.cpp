@@ -245,6 +245,44 @@ int main() {
         printf("ok: out-of-range experts and wrong-layer keys are rejected\n");
     }
 
+    // 8. a shared pool holds experts from several layers at once
+    {
+        fixture f;
+        moe::MemoryExpertStore store;
+        moe::PoolStats st;
+        uint64_t clock = 0;
+        std::vector<int32_t> ids;
+
+        // extend the index with a second layer that reuses the same sources (same shapes, as in a real
+        // model where every MoE layer has identically shaped expert tensors)
+        const uint32_t LAYER_B = LAYER + 2;
+        f.index.moe_layers = { LAYER, LAYER_B };
+        std::vector<moe::ExpertDescriptor> descs(2 * N_EXPERT);
+        for (uint32_t e = 0; e < N_EXPERT; ++e) {
+            descs[e] = f.index.descs[e];
+            moe::ExpertDescriptor d = f.index.descs[e];
+            d.key = { LAYER_B, e };
+            descs[N_EXPERT + e] = d;
+        }
+        f.index.descs = descs;
+
+        moe::LayerPool shared(moe::LayerPool::ANY_LAYER, N_SLOTS,
+                              std::vector<ggml_tensor *>{ f.pool[0], f.pool[1] });
+        CHECK(shared.is_shared());
+
+        std::vector<moe::ExpertKey> mixed = { { LAYER, 1 }, { LAYER_B, 2 } };
+        shared.ensure(f.index, store, mixed, ids, st, clock);
+        CHECK(ids[0] != ids[1]);
+        f.check_slot_holds(ids[0], 1);
+        f.check_slot_holds(ids[1], 2);
+
+        // the same expert id in a different layer is a different key and needs its own slot
+        std::vector<moe::ExpertKey> same_id = { { LAYER, 5 }, { LAYER_B, 5 } };
+        shared.ensure(f.index, store, same_id, ids, st, clock);
+        CHECK(ids[0] != ids[1]);
+        printf("ok: a shared pool serves several layers and keys by (layer, expert)\n");
+    }
+
     printf("all moe-pool tests passed\n");
     return 0;
 }

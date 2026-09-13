@@ -157,11 +157,20 @@ struct PoolStats {
     std::string json() const;
 };
 
-// One compact pool of `n_slots` for one MoE layer, backed by pool tensors (one per slice kind) whose
-// ne[2] == n_slots. The pool does not know what the tensors mean; it only copies bytes.
+// A compact pool of `n_slots`, backed by pool tensors (one per slice kind) whose ne[2] == n_slots.
+// The pool does not know what the tensors mean; it only copies bytes.
+//
+// `layer == ANY_LAYER` makes the pool shared by every MoE layer, which needs all of them to have
+// identically shaped and typed expert tensors. A shared pool uses capacity far better than per-layer
+// pools (see moe-stream-lab/docs/milestones/M2.md): at a 1 GB budget the simulator measured 34.4% hits
+// shared against 3.1% split per layer.
 class LayerPool {
 public:
+    static constexpr uint32_t ANY_LAYER = UINT32_MAX;
+
     LayerPool(uint32_t layer, uint32_t n_slots, std::vector<ggml_tensor *> pool_tensors);
+
+    bool is_shared() const { return layer_ == ANY_LAYER; }
 
     // Make every key in `keys` resident; returns slot ids in the same order. Aborts if the distinct set
     // exceeds n_slots (no silent fallback). All keys must belong to this layer.

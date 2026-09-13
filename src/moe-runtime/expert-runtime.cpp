@@ -326,7 +326,7 @@ void LayerPool::ensure(const ExpertIndex & idx, ExpertStore & store, const std::
     std::vector<ExpertKey> distinct;
     distinct.reserve(keys.size());
     for (const auto & k : keys) {
-        if (k.layer != layer_) {
+        if (layer_ != ANY_LAYER && k.layer != layer_) {
             throw std::runtime_error("moe: key for layer " + std::to_string(k.layer) + " sent to pool of layer " + std::to_string(layer_));
         }
         if (std::find(distinct.begin(), distinct.end(), k) == distinct.end()) {
@@ -334,8 +334,10 @@ void LayerPool::ensure(const ExpertIndex & idx, ExpertStore & store, const std::
         }
     }
     if (distinct.size() > slots_.size()) {
-        fprintf(stderr, "moe: layer %u needs %zu distinct experts in one ubatch but the pool has %zu slots; "
-                        "raise --moe-pool-slots or lower -ub\n", layer_, distinct.size(), slots_.size());
+        const std::string who = layer_ == ANY_LAYER ? std::string("the shared expert pool")
+                                                    : ("layer " + std::to_string(layer_));
+        fprintf(stderr, "moe: %s needs %zu distinct experts in one ubatch but the pool has %zu slots; "
+                        "raise --moe-pool-slots or lower -ub\n", who.c_str(), distinct.size(), slots_.size());
         throw std::runtime_error("moe: expert working set exceeds pool size");
     }
 

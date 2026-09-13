@@ -376,7 +376,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         // not during the params-fit dry run (no_alloc): the pool would allocate its buffer twice
         if (params.moe_pool_slots > 0 && !params.no_alloc) {
-            model->moe_pool = std::make_unique<llama_moe_pool>(*model, params.moe_pool_slots, params.moe_store, fname, params.moe_verify);
+            model->moe_pool = std::make_unique<llama_moe_pool>(*model, params.moe_pool_slots, params.moe_store, fname, params.moe_verify, params.moe_pool_shared);
         }
 
         return {0, model_ptr.release()};
