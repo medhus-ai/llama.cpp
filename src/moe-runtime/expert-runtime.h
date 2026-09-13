@@ -179,7 +179,12 @@ public:
     bool pinned() const { return arena_buf_ != nullptr; }
     const char * name() const override { return name_.c_str(); }
 
-    struct Stats { uint64_t hits = 0, misses = 0, bytes_from_cache = 0, bytes_inserted = 0, evictions = 0; };
+    struct Stats { uint64_t hits = 0, misses = 0, bytes_from_cache = 0, bytes_inserted = 0, evictions = 0;
+                   uint64_t prefetched = 0, prefetch_useful = 0, prefetch_wasted = 0; };
+    bool contains(ExpertKey k) const;
+    // Make `e` resident as a prefetch (no copy out). Counted as useful when a later demand read hits it
+    // before eviction, wasted when it is evicted unused. Returns false if it was already resident.
+    bool prefetch(const ExpertDescriptor & e);
     Stats    stats() const;
     uint64_t resident_bytes() const;
     uint64_t capacity() const { return n_slots_ * bundle_bytes_; }
@@ -192,13 +197,14 @@ private:
         uint32_t layer = 0, expert = 0;
         int      prev = -1, next = -1;   // LRU list, head = most recent
         uint32_t readers = 0;             // threads copying out of this slab (cannot be evicted)
+        bool     prefetched = false;      // inserted by prefetch() and not yet used by a demand read
     };
     // returns slab index holding `key` READY (waits for LOADING), or -1 with a reserved LOADING slab in `reserved`
     int acquire_locked(std::unique_lock<std::mutex> & lock, ExpertKey key, int & reserved);
     void lru_touch_locked(int i);
     void lru_unlink_locked(int i);
     int  lru_victim_locked() const;
-    int  resident_index(const ExpertDescriptor & e);   // hit or fill, returns slab index with readers++
+    int  resident_index(const ExpertDescriptor & e, bool is_prefetch = false);   // hit or fill, returns slab index with readers++
 
     std::unique_ptr<ExpertStore> inner_;
     uint64_t bundle_bytes_;
@@ -314,6 +320,7 @@ public:
     uint32_t io_threads() const { return io_threads_; }
 
     uint32_t n_slots() const { return (uint32_t) slots_.size(); }
+    bool contains(ExpertKey k) const { return find(k) >= 0; }
     const std::vector<Slot> & slots() const { return slots_; }
 
 private:

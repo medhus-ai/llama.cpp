@@ -20,7 +20,8 @@ struct ggml_context;
 
 struct llama_moe_pool {
     // store_mode: 0 = resident tensors (memory), 1 = positional reads from the model file
-    llama_moe_pool(llama_model & model, int32_t n_slots, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads, const std::string & pack_path, uint64_t host_cache_bytes);
+    llama_moe_pool(llama_model & model, int32_t n_slots, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads, const std::string & pack_path, uint64_t host_cache_bytes,
+                   int32_t prefetch_k, int32_t prefetch_lookahead, const char * prefetch_src);
     ~llama_moe_pool();
 
     llama_moe_pool(const llama_moe_pool &) = delete;
@@ -40,6 +41,24 @@ struct llama_moe_pool {
     ggml_backend_t transfer_backend_ = nullptr;   // owned; a second backend instance = its own stream
     ggml_backend_dev_t device_ = nullptr;
     bool async_enabled_ = true;
+
+    // M9: the model's own routers as prerouters. At the residual-stream tensor of block j, run the router of
+    // the MoE layer that is `lookahead` MoE layers ahead and pull its top-k non-resident candidates into the
+    // host tier in the background. Never touches the VRAM pool, never changes routing.
+    struct prerouter_t {
+        bool     enabled   = false;
+        int      k         = 12;
+        int      lookahead = 1;     // in MoE layers
+        std::string src_prefix;     // e.g. "nemotron_h_block_out-"
+        struct layer_t { uint32_t il; std::vector<float> norm, gate, bias; uint32_t n_embd = 0, n_expert = 0; };
+        std::vector<layer_t> layers;             // by index_.moe_layers order
+        std::vector<float>   x;                  // scratch: [n_tok, n_embd]
+        std::vector<float>   logits;             // scratch
+        uint64_t predictions = 0, issued = 0, demand_delayed = 0;
+    } prerouter_;
+    void init_prerouter(llama_model & model, int k, int lookahead, const std::string & src_prefix);
+    void on_residual(struct ggml_tensor * t, uint32_t block);
+    std::unique_ptr<moe::FetchWorkers> prefetch_workers_;
     bool    shared_ = false;
 
 private:

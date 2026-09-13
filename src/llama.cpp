@@ -378,7 +378,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (params.moe_pool_slots > 0 && !params.no_alloc) {
             model->moe_pool = std::make_unique<llama_moe_pool>(*model, params.moe_pool_slots, params.moe_store, fname, params.moe_verify, params.moe_pool_shared, params.moe_io_threads,
                                                          params.moe_pack_path ? std::string(params.moe_pack_path) : (fname.substr(0, fname.find_last_of('.')) + ".moepack"),
-                                                         params.moe_host_cache_bytes);
+                                                         params.moe_host_cache_bytes,
+                                                         params.moe_prefetch_k, params.moe_prefetch_lookahead, params.moe_prefetch_src);
             model->moe_pool->async_enabled_ = !params.moe_sync_io;
         }
 

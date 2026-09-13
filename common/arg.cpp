@@ -4534,6 +4534,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--moe-prefetch"}, "K",
+        "moe-stream-lab: prerouter prefetch - run the next MoE layer's own router on the current residual stream and pull its top-K experts into the host tier ahead of demand (0 = off; needs --moe-host-cache)",
+        [](common_params & params, int value) {
+            params.moe_prefetch_k = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH"));
+    add_opt(common_arg(
+        {"--moe-prefetch-lookahead"}, "N",
+        "moe-stream-lab: how many MoE layers ahead the prerouter predicts (default 1)",
+        [](common_params & params, int value) {
+            params.moe_prefetch_lookahead = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-prefetch-src"}, "NAME",
+        "moe-stream-lab: residual-stream tensor name prefix the prerouter reads (default: nemotron_h_block_out)",
+        [](common_params & params, const std::string & value) {
+            params.moe_prefetch_src = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-sync-io"},
         "moe-stream-lab: copy experts to the device synchronously instead of on a dedicated transfer stream (A/B)",
         [](common_params & params) {

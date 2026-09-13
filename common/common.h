@@ -518,6 +518,9 @@ struct common_params {
 
     // llama-debug specific options
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
+    int32_t     moe_prefetch_k = 0;         // moe-stream-lab: prerouter candidates per token (0 = off)              // NOLINT
+    int32_t     moe_prefetch_lookahead = 1; // moe-stream-lab: MoE layers of lead                                  // NOLINT
+    std::string moe_prefetch_src;           // moe-stream-lab: residual tensor prefix (empty = arch default)        // NOLINT
     bool        moe_sync_io = false;        // moe-stream-lab: disable the async transfer stream (A/B)                 // NOLINT
     uint64_t    moe_host_cache_bytes = 0;   // moe-stream-lab: RAM cache of expert bundles (0 = off)                  // NOLINT
     std::string moe_pack_path;              // moe-stream-lab: moepack sidecar path (empty = <model>.moepack)      // NOLINT
