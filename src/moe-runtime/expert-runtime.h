@@ -12,6 +12,10 @@
 #include <cstdint>
 #include <memory>
 #include <utility>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -172,6 +176,28 @@ private:
     std::atomic<uint64_t>        checked_{0};
 };
 
+// A persistent pool of fetch workers: spawning std::threads per callback costs real time when a decode
+// token triggers 23 callbacks with ~1-2 misses each. Tasks are run with run(n, fn) which calls fn(i) for
+// i in [0, n) across the workers and returns when all are done; exceptions are rethrown on the caller.
+class FetchWorkers {
+public:
+    explicit FetchWorkers(uint32_t n_threads);
+    ~FetchWorkers();
+    uint32_t size() const { return (uint32_t) threads_.size(); }
+    void run(size_t n, const std::function<void(size_t)> & fn);
+
+private:
+    void loop();
+    std::vector<std::thread> threads_;
+    std::mutex mtx_;
+    std::condition_variable cv_, done_cv_;
+    const std::function<void(size_t)> * fn_ = nullptr;
+    size_t n_ = 0, next_ = 0, done_ = 0;
+    uint64_t gen_ = 0;
+    bool stop_ = false;
+    std::vector<std::exception_ptr> errors_;
+};
+
 enum class SlotState : uint8_t { FREE, LOADING, READY, IN_USE };
 
 struct Slot {
@@ -214,7 +240,7 @@ public:
 
     // Number of worker threads used to fetch the misses of one ubatch. 1 keeps the original fully
     // sequential path, so the effect of parallel fetch can be measured by turning it off.
-    void set_io_threads(uint32_t n) { io_threads_ = n < 1 ? 1 : n; }
+    void set_io_threads(uint32_t n);
     void set_host_pool(bool host) { host_pool_ = host; }
     uint32_t io_threads() const { return io_threads_; }
 
@@ -233,6 +259,7 @@ private:
 
     uint32_t layer_;
     uint32_t io_threads_ = 1;
+    std::unique_ptr<FetchWorkers> workers_;
     bool     host_pool_  = true;   // false when the pool tensors live in device memory
     std::vector<Slot> slots_;
     std::vector<ggml_tensor *> tensors_;  // pool tensor per slice kind, same order as descriptor slices
