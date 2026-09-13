@@ -322,6 +322,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         ml.lazy.mode = params.lazy_mode;
 
+        // moe-stream-lab: when the pool reads experts from storage, keep their tensors off the resident path
+        ml.lazy.moe_pool = params.moe_pool_slots > 0 && params.moe_store >= 1;
+
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 

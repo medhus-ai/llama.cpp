@@ -90,6 +90,13 @@ struct llama_model_loader {
         // set by the caller before the create_tensor() calls
         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
 
+        // moe-stream-lab: when the compact expert pool serves routed experts from storage, their tensors
+        // must not be made resident at load time. Set before the create_tensor() calls.
+        bool moe_pool = false;
+
+        // does this tensor hold routed expert weights? (stock llama.cpp naming)
+        static bool is_routed_expert(const std::string & name);
+
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
         bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
