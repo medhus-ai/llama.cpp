@@ -1085,15 +1085,25 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
-    if (mode == LLAMA_LAZY_MODE_OFF) {
-        return false;
-    }
+bool llama_model_loader::lazy_read::is_routed_expert(const std::string & name) {
+    static const std::regex re("\\.ffn_(up|down|gate|gate_up)_exps\\.weight$");
+    return std::regex_search(name, re);
+}
 
-    // do not lazy-read small tensors, it has significant overhead and is not worth it
-    constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
-        return false;
+bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
+    // routed experts served by the compact pool are never made resident, whatever the lazy mode says
+    const bool forced = moe_pool && is_routed_expert(name);
+
+    if (!forced) {
+        if (mode == LLAMA_LAZY_MODE_OFF) {
+            return false;
+        }
+
+        // do not lazy-read small tensors, it has significant overhead and is not worth it
+        constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
+        if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+            return false;
+        }
     }
 
     if (!llama_mmap::SUPPORTED) {
@@ -1106,8 +1116,10 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
         ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
         tensors.insert(name);
 
-        LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
-                __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
+        if (!forced) {
+            LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
+                    __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
+        }
     }
 
     return true;
@@ -1339,7 +1351,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    if ((flags & TENSOR_READ_LAZY) || (lazy.moe_pool && lazy_read::is_routed_expert(tn.str()))) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
