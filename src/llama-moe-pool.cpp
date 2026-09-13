@@ -280,13 +280,10 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
     // Parallel fetch writes into disjoint byte ranges of the pool tensors from several threads, which is
     // safe for host buffers (a memcpy each) but not for device buffers, where the transfer goes through a
     // stream. Refuse rather than corrupt; the device path gets its own transfer scheduler in M6/M8.
-    int32_t n_io = io_threads > 0 ? io_threads : 1;
-    if (n_io > 1 && !all_host) {
-        fprintf(stderr, "moe pool: --moe-io-threads > 1 is only supported for host pool buffers "
-                        "(this pool is in %s), falling back to sequential fetch\n", buft_names.c_str());
-        n_io = 1;
-    }
+    // Device pools read in parallel too; only the H2D copies are serialised on the calling thread.
+    const int32_t n_io = io_threads > 0 ? io_threads : 1;
     for (auto & pool : pools_) {
+        pool->set_host_pool(all_host);
         pool->set_io_threads((uint32_t) n_io);
     }
 

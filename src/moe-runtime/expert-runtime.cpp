@@ -315,6 +315,9 @@ LayerPool::LayerPool(uint32_t layer, uint32_t n_slots, std::vector<ggml_tensor *
         if (t->ne[2] != (int64_t) n_slots) {
             throw std::runtime_error("moe: pool tensor ne[2] != n_slots");
         }
+        if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+            host_pool_ = false;
+        }
     }
 }
 
@@ -346,9 +349,8 @@ int LayerPool::pick_victim() const {
     return best;  // -1 if everything is IN_USE or LOADING
 }
 
-// Fetch every slice of `d` into `slot`. A PackExpertStore gets one bundle read; other stores one read per
-// slice. `staging` is the caller's scratch buffer (per thread).
-void LayerPool::fetch_into(ExpertStore & store, const ExpertDescriptor & d, int slot, std::vector<uint8_t> & staging) {
+// Read every slice of `d` into `staging` (contiguous, slice order). Safe on any thread.
+static void read_expert(ExpertStore & store, const ExpertDescriptor & d, std::vector<uint8_t> & staging) {
     staging.resize(d.total_bytes);
     std::vector<void *> dsts(d.slices.size());
     uint64_t off = 0;
@@ -363,9 +365,20 @@ void LayerPool::fetch_into(ExpertStore & store, const ExpertDescriptor & d, int 
             store.read_slice(d, i, dsts[i]);
         }
     }
+}
+
+// Copy a staged expert into `slot` of the pool tensors (host memcpy or H2D, depending on the buffer).
+void LayerPool::publish(const ExpertDescriptor & d, int slot, const std::vector<uint8_t> & staging) {
+    uint64_t off = 0;
     for (size_t i = 0; i < d.slices.size(); ++i) {
-        ggml_backend_tensor_set(tensors_[i], dsts[i], (size_t) slot * tensors_[i]->nb[2], d.slices[i].bytes);
+        ggml_backend_tensor_set(tensors_[i], staging.data() + off, (size_t) slot * tensors_[i]->nb[2], d.slices[i].bytes);
+        off += d.slices[i].bytes;
     }
+}
+
+void LayerPool::fetch_into(ExpertStore & store, const ExpertDescriptor & d, int slot, std::vector<uint8_t> & staging) {
+    read_expert(store, d, staging);
+    publish(d, slot, staging);
 }
 
 void LayerPool::load(const ExpertIndex & idx, ExpertStore & store, ExpertKey k, int slot, PoolStats & stats) {
@@ -416,6 +429,7 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
     std::atomic<size_t> next{0};
     std::atomic<uint64_t> bytes{0};
     std::vector<std::exception_ptr> errors(n_threads);
+    std::vector<std::vector<uint8_t>> staged(host_pool_ ? 0 : work.size());
     std::vector<std::thread> workers;
     workers.reserve(n_threads);
 
@@ -438,8 +452,14 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
                             throw std::runtime_error("moe: slice bytes != pool slot bytes for " + d.slices[k].name);
                         }
                     }
-                    // disjoint byte ranges of the same tensors, one slot per worker at a time
-                    fetch_into(store, d, slot, buf);
+                    if (host_pool_) {
+                        // disjoint byte ranges of the same host tensors: workers may write directly
+                        fetch_into(store, d, slot, buf);
+                    } else {
+                        // device pool: workers only read from storage; the H2D copies are issued below
+                        // by the calling thread, in order, so the backend sees a single stream of sets
+                        read_expert(store, d, staged[i]);
+                    }
                     bytes.fetch_add(d.total_bytes, std::memory_order_relaxed);
                 }
             } catch (...) {
@@ -456,6 +476,11 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
         }
     }
 
+    if (!host_pool_) {
+        for (size_t i = 0; i < work.size(); ++i) {
+            publish(idx.get(work[i].first), work[i].second, staged[i]);
+        }
+    }
     for (const auto & w : work) {
         slots_[w.second].state = SlotState::READY;
     }

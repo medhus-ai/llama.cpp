@@ -215,6 +215,7 @@ public:
     // Number of worker threads used to fetch the misses of one ubatch. 1 keeps the original fully
     // sequential path, so the effect of parallel fetch can be measured by turning it off.
     void set_io_threads(uint32_t n) { io_threads_ = n < 1 ? 1 : n; }
+    void set_host_pool(bool host) { host_pool_ = host; }
     uint32_t io_threads() const { return io_threads_; }
 
     uint32_t n_slots() const { return (uint32_t) slots_.size(); }
@@ -225,12 +226,14 @@ private:
     int pick_victim() const;
     void load(const ExpertIndex & idx, ExpertStore & store, ExpertKey k, int slot, PoolStats & stats);
     void fetch_into(ExpertStore & store, const ExpertDescriptor & d, int slot, std::vector<uint8_t> & staging);
+    void publish(const ExpertDescriptor & d, int slot, const std::vector<uint8_t> & staging);
     // fetch several (key, slot) pairs, using io_threads_ workers; byte counts are accumulated per worker
     void load_many(const ExpertIndex & idx, ExpertStore & store,
                    const std::vector<std::pair<ExpertKey, int>> & work, PoolStats & stats);
 
     uint32_t layer_;
     uint32_t io_threads_ = 1;
+    bool     host_pool_  = true;   // false when the pool tensors live in device memory
     std::vector<Slot> slots_;
     std::vector<ggml_tensor *> tensors_;  // pool tensor per slice kind, same order as descriptor slices
     std::vector<uint8_t> staging_;
