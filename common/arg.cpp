@@ -4616,6 +4616,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_DUMP_DIR"));
     add_opt(common_arg(
+        {"--moe-dump-prefix"}, "NAME",
+        "moe-stream-lab: tensor name (without the -<layer> suffix) to dump with --moe-dump-dir (default ffn_moe_out)",
+        [](common_params & params, const std::string & value) {
+            params.moe_dump_prefix = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-dump-ubatches"}, "N",
         "moe-stream-lab: how many ubatches to dump with --moe-dump-dir (default 2)",
         [](common_params & params, int value) {

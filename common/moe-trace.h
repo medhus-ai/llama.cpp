@@ -29,6 +29,8 @@ void common_moe_trace_set_enabled(bool enabled);
 // `n_ubatches` ubatches as raw F32 files "<dir>/ub<k>_layer<il>.f32" (header: two uint32 ne[0], ne[1]).
 // Same prompt in two modes -> compare with moe-stream-lab/scripts/compare_moe_out.py.
 void common_moe_trace_set_dump(const std::string & dir, int n_ubatches);
+// Optional: dump tensors whose name (before the -<il> suffix) matches this prefix instead of ffn_moe_out.
+void common_moe_trace_set_dump_prefix(const std::string & prefix);
 
 // Flush and close (also called automatically at exit).
 void common_moe_trace_close();
