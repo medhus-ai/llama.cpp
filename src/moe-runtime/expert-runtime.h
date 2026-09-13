@@ -163,12 +163,20 @@ private:
 // inner store straight into the arena slot while other threads may wait on that slot. Thread-safe.
 class CachingExpertStore : public ExpertStore {
 public:
-    CachingExpertStore(std::unique_ptr<ExpertStore> inner, uint64_t capacity_bytes, uint64_t bundle_bytes);
+    // `host_buft` (optional): allocate the arena from this buffer type, e.g. the device's pinned host
+    // buffer type so H2D copies out of the arena run at DMA speed. nullptr = plain aligned malloc.
+    CachingExpertStore(std::unique_ptr<ExpertStore> inner, uint64_t capacity_bytes, uint64_t bundle_bytes,
+                       ggml_backend_buffer_type_t host_buft = nullptr);
     ~CachingExpertStore() override;
 
     void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
     // fetch all slices of `e` into dsts (one per slice); counts one hit or miss per bundle
     void read_bundle(const ExpertDescriptor & e, const std::vector<void *> & dsts);
+    // Zero-copy access: make the bundle resident and return a pointer to it, holding a reader reference
+    // (the slab cannot be evicted) until release_bundle(). Slices are contiguous in descriptor order.
+    const uint8_t * acquire_bundle(const ExpertDescriptor & e);
+    void release_bundle(const ExpertDescriptor & e);
+    bool pinned() const { return arena_buf_ != nullptr; }
     const char * name() const override { return name_.c_str(); }
 
     struct Stats { uint64_t hits = 0, misses = 0, bytes_from_cache = 0, bytes_inserted = 0, evictions = 0; };
@@ -190,11 +198,13 @@ private:
     void lru_touch_locked(int i);
     void lru_unlink_locked(int i);
     int  lru_victim_locked() const;
+    int  resident_index(const ExpertDescriptor & e);   // hit or fill, returns slab index with readers++
 
     std::unique_ptr<ExpertStore> inner_;
     uint64_t bundle_bytes_;
     uint64_t n_slots_;
     uint8_t * arena_ = nullptr;
+    ggml_backend_buffer_t arena_buf_ = nullptr;   // when allocated from a backend host buffer type
     std::vector<Slab> slabs_;
     std::map<std::pair<uint32_t, uint32_t>, int> index_;
     int head_ = -1, tail_ = -1;

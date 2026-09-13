@@ -271,7 +271,13 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         default: throw std::runtime_error("moe pool: unknown store mode " + std::to_string(store_mode));
     }
     if (host_cache_bytes > 0 && store_mode >= 1) {
-        auto cache = std::make_unique<moe::CachingExpertStore>(std::move(store_), host_cache_bytes, index_.descs[0].total_bytes);
+        // on a device pool, allocate the arena from the device's pinned host buffer type (DMA-speed H2D)
+        ggml_backend_buffer_type_t host_buft = nullptr;
+        if (!all_host) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        }
+        auto cache = std::make_unique<moe::CachingExpertStore>(std::move(store_), host_cache_bytes, index_.descs[0].total_bytes, host_buft);
         host_cache_ = cache.get();
         store_ = std::move(cache);
     }
