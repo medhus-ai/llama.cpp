@@ -68,6 +68,8 @@ struct llama_moe_pool {
     void prefetch_loop();
     void init_prerouter(llama_model & model, int k, int lookahead, const std::string & src_prefix);
     void on_residual(struct ggml_tensor * t, uint32_t block);
+    void on_prefetch_ids(struct ggml_tensor * t, uint32_t layer);   // in-graph prerouter output
+    bool prerouter_in_graph_ = true;
 
     bool    shared_ = false;
 

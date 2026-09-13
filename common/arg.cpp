@@ -4549,7 +4549,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-prefetch-src"}, "NAME",
-        "moe-stream-lab: tensor name prefix the prerouter reads, the normed input of each MoE layer (default: attn_norm)",
+        "moe-stream-lab: use the CPU prerouter on this tensor prefix (e.g. attn_norm) instead of the in-graph router nodes (A/B)",
         [](common_params & params, const std::string & value) {
             params.moe_prefetch_src = value;
         }
