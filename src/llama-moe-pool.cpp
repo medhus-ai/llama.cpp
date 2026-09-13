@@ -74,7 +74,7 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
     // The index stays model-independent: it only records byte ranges.
     gguf_context * meta = nullptr;
     uint64_t       meta_data_offset = 0;
-    if (store_mode == 1) {
+    if (store_mode >= 1) {
         if (model_path.empty()) {
             throw std::runtime_error("moe pool: file store requested but the model path is unknown (split models are not supported yet)");
         }
@@ -164,14 +164,15 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         gguf_free(meta);
     }
 
-    if (store_mode == 1) {
-        store_ = std::make_unique<moe::BufferedFileExpertStore>(model_path);
-    } else {
-        store_ = std::make_unique<moe::MemoryExpertStore>();
+    switch (store_mode) {
+        case 0:  store_ = std::make_unique<moe::MemoryExpertStore>();               break;
+        case 1:  store_ = std::make_unique<moe::BufferedFileExpertStore>(model_path); break;
+        case 2:  store_ = std::make_unique<moe::DirectIOExpertStore>(model_path);   break;
+        default: throw std::runtime_error("moe pool: unknown store mode " + std::to_string(store_mode));
     }
     if (verify) {
         if (store_mode == 0) {
-            throw std::runtime_error("moe pool: --moe-verify needs a non-reference store (use --moe-store file)");
+            throw std::runtime_error("moe pool: --moe-verify needs a non-reference store (use --moe-store file or direct)");
         }
         store_ = std::make_unique<moe::VerifyingExpertStore>(std::move(store_), std::make_unique<moe::MemoryExpertStore>());
     }

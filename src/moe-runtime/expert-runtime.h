@@ -86,6 +86,38 @@ private:
     uint64_t    bytes_ = 0;
 };
 
+// Reads expert bytes with O_DIRECT, bypassing the page cache. GGUF expert slabs are not block-aligned,
+// so each read covers the aligned range containing the slice and the wanted bytes are copied out of it
+// (see moe-stream-lab/docs/decisions/0004-direct-io-before-moepack.md). Falls back to buffered reads,
+// with an explicit warning, when O_DIRECT is not available on the filesystem.
+class DirectIOExpertStore : public ExpertStore {
+public:
+    explicit DirectIOExpertStore(const std::string & path);
+    ~DirectIOExpertStore() override;
+
+    void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
+    const char * name() const override { return direct_ ? "direct" : "direct(fallback:buffered)"; }
+
+    uint64_t reads() const { return reads_; }
+    uint64_t bytes_read() const { return bytes_read_; }   // bytes actually pulled from the device
+    uint64_t bytes_used() const { return bytes_used_; }   // bytes the caller asked for
+    size_t   align() const { return align_; }
+    bool     is_direct() const { return direct_; }
+
+private:
+    void ensure_buffer(size_t bytes);
+
+    std::string path_;
+    int         fd_      = -1;
+    bool        direct_  = false;
+    size_t      align_   = 4096;
+    uint8_t *   buf_     = nullptr;
+    size_t      buf_cap_ = 0;
+    uint64_t    reads_      = 0;
+    uint64_t    bytes_read_ = 0;
+    uint64_t    bytes_used_ = 0;
+};
+
 // Reads every slice through both stores and aborts on the first differing byte. Used by --moe-verify to
 // prove that a new storage path returns exactly the bytes the reference path returns.
 class VerifyingExpertStore : public ExpertStore {

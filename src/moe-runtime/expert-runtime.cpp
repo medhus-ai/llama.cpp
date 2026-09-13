@@ -5,11 +5,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
 #ifndef _WIN32
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #else
 #include <cstdio>
@@ -87,6 +90,127 @@ void BufferedFileExpertStore::read_slice(const ExpertDescriptor & e, size_t slic
 #else
     (void) e; (void) slice; (void) dst;
     throw std::runtime_error("moe: BufferedFileExpertStore is implemented for POSIX only");
+#endif
+}
+
+#ifndef _WIN32
+// Logical block size of the device holding `path`, or 0 if it cannot be determined.
+static size_t device_logical_block_size(const std::string & path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        return 0;
+    }
+    char sysfs[256];
+    snprintf(sysfs, sizeof(sysfs), "/sys/dev/block/%u:%u/queue/logical_block_size",
+             (unsigned) major(st.st_dev), (unsigned) minor(st.st_dev));
+    FILE * f = fopen(sysfs, "r");
+    if (!f) {
+        // partitions expose the queue through their parent
+        snprintf(sysfs, sizeof(sysfs), "/sys/dev/block/%u:%u/../queue/logical_block_size",
+                 (unsigned) major(st.st_dev), (unsigned) minor(st.st_dev));
+        f = fopen(sysfs, "r");
+    }
+    if (!f) {
+        return 0;
+    }
+    unsigned v = 0;
+    const int n = fscanf(f, "%u", &v);
+    fclose(f);
+    return n == 1 ? (size_t) v : 0;
+}
+#endif
+
+DirectIOExpertStore::DirectIOExpertStore(const std::string & path) : path_(path) {
+#ifndef _WIN32
+    const size_t bs = device_logical_block_size(path);
+    align_ = bs ? bs : 4096;
+
+    fd_ = open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (fd_ >= 0) {
+        direct_ = true;
+    } else {
+        fd_ = open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) {
+            throw std::runtime_error("moe: cannot open model file for expert reads: " + path);
+        }
+        direct_ = false;
+        fprintf(stderr, "moe: O_DIRECT is not available for %s, falling back to buffered reads "
+                        "(measurements will include page-cache effects)\n", path.c_str());
+    }
+    fprintf(stderr, "moe: direct store on %s, alignment %zu bytes, O_DIRECT %s\n",
+            path.c_str(), align_, direct_ ? "on" : "off");
+#else
+    throw std::runtime_error("moe: DirectIOExpertStore is implemented for POSIX only");
+#endif
+}
+
+DirectIOExpertStore::~DirectIOExpertStore() {
+#ifndef _WIN32
+    if (buf_) {
+        free(buf_);
+    }
+    if (fd_ >= 0) {
+        close(fd_);
+    }
+#endif
+}
+
+void DirectIOExpertStore::ensure_buffer(size_t bytes) {
+#ifndef _WIN32
+    if (buf_cap_ >= bytes) {
+        return;
+    }
+    if (buf_) {
+        free(buf_);
+        buf_ = nullptr;
+    }
+    void * p = nullptr;
+    if (posix_memalign(&p, align_, bytes) != 0 || !p) {
+        throw std::runtime_error("moe: cannot allocate an aligned staging buffer of " + std::to_string(bytes) + " bytes");
+    }
+    buf_ = (uint8_t *) p;
+    buf_cap_ = bytes;
+#else
+    (void) bytes;
+#endif
+}
+
+void DirectIOExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
+#ifndef _WIN32
+    const TensorSlice & s = e.slices.at(slice);
+    if (s.file_offset == 0) {
+        throw std::runtime_error("moe: no file offset recorded for " + s.name);
+    }
+    const uint64_t begin   = (s.file_offset / align_) * align_;
+    const uint64_t end     = ((s.file_offset + s.bytes + align_ - 1) / align_) * align_;
+    const size_t   span    = (size_t) (end - begin);
+    ensure_buffer(span);
+
+    size_t   got = 0;
+    while (got < span) {
+        const ssize_t n = pread(fd_, buf_ + got, span - got, (off_t) (begin + got));
+        if (n < 0) {
+            throw std::runtime_error("moe: read error for " + s.name + " at offset " + std::to_string(begin + got));
+        }
+        if (n == 0) {
+            // a short final read is only legal past EOF, which must still cover the slice
+            if (begin + got < s.file_offset + s.bytes) {
+                throw std::runtime_error("moe: unexpected EOF reading " + s.name);
+            }
+            break;
+        }
+        got += (size_t) n;
+        reads_++;
+    }
+    if (begin + got < s.file_offset + s.bytes) {
+        throw std::runtime_error("moe: short read for " + s.name);
+    }
+    memcpy(dst, buf_ + (s.file_offset - begin), s.bytes);
+    bytes_read_ += got;
+    bytes_used_ += s.bytes;
+#else
+    (void) e; (void) slice; (void) dst;
+    throw std::runtime_error("moe: DirectIOExpertStore is implemented for POSIX only");
 #endif
 }
 
