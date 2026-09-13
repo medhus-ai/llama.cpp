@@ -272,22 +272,37 @@ void PackExpertStore::read_bundle(const ExpertDescriptor & e, const std::vector<
     }
 }
 
-CachingExpertStore::CachingExpertStore(std::unique_ptr<ExpertStore> inner, uint64_t capacity_bytes, uint64_t bundle_bytes)
+CachingExpertStore::CachingExpertStore(std::unique_ptr<ExpertStore> inner, uint64_t capacity_bytes, uint64_t bundle_bytes,
+                                       ggml_backend_buffer_type_t host_buft)
     : inner_(std::move(inner)), bundle_bytes_(bundle_bytes) {
     n_slots_ = bundle_bytes ? capacity_bytes / bundle_bytes : 0;
     if (n_slots_ > 0) {
-        void * p = nullptr;
-        if (posix_memalign(&p, 4096, (size_t) (n_slots_ * bundle_bytes_)) != 0 || !p) {
-            throw std::runtime_error("moe: cannot allocate the host expert cache arena");
+        const size_t bytes = (size_t) (n_slots_ * bundle_bytes_);
+        if (host_buft) {
+            arena_buf_ = ggml_backend_buft_alloc_buffer(host_buft, bytes);
+            if (!arena_buf_) {
+                fprintf(stderr, "moe: could not allocate a %zu MiB pinned arena from %s, using pageable memory\n",
+                        bytes >> 20, ggml_backend_buft_name(host_buft));
+            } else {
+                arena_ = (uint8_t *) ggml_backend_buffer_get_base(arena_buf_);
+            }
         }
-        arena_ = (uint8_t *) p;
+        if (!arena_) {
+            void * p = nullptr;
+            if (posix_memalign(&p, 4096, bytes) != 0 || !p) {
+                throw std::runtime_error("moe: cannot allocate the host expert cache arena");
+            }
+            arena_ = (uint8_t *) p;
+        }
         slabs_.resize((size_t) n_slots_);
     }
-    name_ = std::string("hostcache(") + inner_->name() + ")";
+    name_ = std::string(arena_buf_ ? "hostcache-pinned(" : "hostcache(") + inner_->name() + ")";
 }
 
 CachingExpertStore::~CachingExpertStore() {
-    if (arena_) {
+    if (arena_buf_) {
+        ggml_backend_buffer_free(arena_buf_);
+    } else if (arena_) {
         free(arena_);
     }
 }
@@ -359,14 +374,7 @@ int CachingExpertStore::acquire_locked(std::unique_lock<std::mutex> & lock, Expe
     }
 }
 
-void CachingExpertStore::read_bundle(const ExpertDescriptor & e, const std::vector<void *> & dsts) {
-    if (n_slots_ == 0 || e.total_bytes != bundle_bytes_) {
-        // pass-through (cache disabled or a descriptor of a different size)
-        for (size_t i = 0; i < e.slices.size(); ++i) {
-            inner_->read_slice(e, i, dsts[i]);
-        }
-        return;
-    }
+int CachingExpertStore::resident_index(const ExpertDescriptor & e) {
     std::unique_lock<std::mutex> lock(mtx_);
     int reserved = -1;
     int i = acquire_locked(lock, e.key, reserved);
@@ -400,7 +408,35 @@ void CachingExpertStore::read_bundle(const ExpertDescriptor & e, const std::vect
     }
     lru_touch_locked(i);
     slabs_[i].readers++;
-    lock.unlock();
+    return i;
+}
+
+const uint8_t * CachingExpertStore::acquire_bundle(const ExpertDescriptor & e) {
+    if (n_slots_ == 0 || e.total_bytes != bundle_bytes_) {
+        throw std::runtime_error("moe: acquire_bundle on a pass-through host cache");
+    }
+    const int i = resident_index(e);
+    return arena_ + (size_t) i * bundle_bytes_;
+}
+
+void CachingExpertStore::release_bundle(const ExpertDescriptor & e) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto it = index_.find({ e.key.layer, e.key.expert });
+    if (it != index_.end() && slabs_[it->second].readers > 0) {
+        slabs_[it->second].readers--;
+    }
+    cv_.notify_all();
+}
+
+void CachingExpertStore::read_bundle(const ExpertDescriptor & e, const std::vector<void *> & dsts) {
+    if (n_slots_ == 0 || e.total_bytes != bundle_bytes_) {
+        // pass-through (cache disabled or a descriptor of a different size)
+        for (size_t i = 0; i < e.slices.size(); ++i) {
+            inner_->read_slice(e, i, dsts[i]);
+        }
+        return;
+    }
+    const int i = resident_index(e);
     // copy out without holding the lock; the slab cannot be evicted while readers > 0
     const uint8_t * slab = arena_ + (size_t) i * bundle_bytes_;
     uint64_t off = 0;
@@ -408,9 +444,7 @@ void CachingExpertStore::read_bundle(const ExpertDescriptor & e, const std::vect
         memcpy(dsts[k], slab + off, e.slices[k].bytes);
         off += e.slices[k].bytes;
     }
-    lock.lock();
-    slabs_[i].readers--;
-    cv_.notify_all();
+    release_bundle(e);
 }
 
 void CachingExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
@@ -665,6 +699,8 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
 
     std::atomic<uint64_t> bytes{0};
     std::vector<std::vector<uint8_t>> staged(host_pool_ ? 0 : work.size());
+    auto * cache = host_pool_ ? nullptr : dynamic_cast<CachingExpertStore *>(&store);
+    std::vector<const uint8_t *> views(cache ? work.size() : 0, nullptr);
     // one staging buffer per worker for host pools (workers write straight into the pool tensors)
     std::vector<std::vector<uint8_t>> worker_buf(workers_ ? workers_->size() : 1);
     std::atomic<uint32_t> buf_ticket{0};
@@ -686,6 +722,10 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
                 my_buf = (int) (buf_ticket.fetch_add(1) % worker_buf.size());
             }
             fetch_into(store, d, slot, worker_buf[my_buf]);
+        } else if (cache) {
+            // device pool + host tier: make the bundle resident in the (pinned) arena; the H2D copy below
+            // reads straight from it, so there is no intermediate pageable copy
+            views[i] = cache->acquire_bundle(d);
         } else {
             read_expert(store, d, staged[i]);
         }
@@ -696,7 +736,17 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
 
     if (!host_pool_) {
         for (size_t i = 0; i < work.size(); ++i) {
-            publish(idx.get(work[i].first), work[i].second, staged[i]);
+            const ExpertDescriptor & d = idx.get(work[i].first);
+            if (cache) {
+                uint64_t off = 0;
+                for (size_t k = 0; k < d.slices.size(); ++k) {
+                    ggml_backend_tensor_set(tensors_[k], views[i] + off, (size_t) work[i].second * tensors_[k]->nb[2], d.slices[k].bytes);
+                    off += d.slices[k].bytes;
+                }
+                cache->release_bundle(d);
+            } else {
+                publish(d, work[i].second, staged[i]);
+            }
         }
     }
     for (const auto & w : work) {
