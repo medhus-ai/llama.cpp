@@ -14,7 +14,7 @@
 
 static const char * SLOT_IDS_PREFIX = "ffn_moe_slot_ids-";
 
-llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t store_mode, const std::string & model_path, bool verify)
+llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t store_mode, const std::string & model_path, bool verify, bool shared)
     : n_slots(n_slots_) {
     if (n_slots <= 0) {
         throw std::runtime_error("moe pool: n_slots must be > 0");
@@ -22,10 +22,6 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
     const uint32_t n_expert = model.hparams.n_expert;
     if (n_expert == 0) {
         throw std::runtime_error("moe pool: model has no routed experts");
-    }
-    if ((uint32_t) n_slots > n_expert) {
-        LLAMA_LOG_WARN("%s: n_slots (%d) > n_expert (%u), clamping\n", __func__, n_slots, n_expert);
-        n_slots = (int32_t) n_expert;
     }
     index_.n_expert = n_expert;
 
@@ -89,6 +85,41 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
     ggml_backend_buffer_type_t buft = nullptr;
     index_.descs.resize(index_.moe_layers.size() * n_expert);
 
+    // A single pool shared by every MoE layer needs all of them to have identically shaped and typed
+    // expert tensors. Check that before committing to the shared layout.
+    bool uniform = true;
+    {
+        const uint32_t il0 = index_.moe_layers[0];
+        for (uint32_t il : index_.moe_layers) {
+            for (const auto & k : kinds) {
+                const ggml_tensor * a_t = model.layers[il0].*k.field;
+                const ggml_tensor * b_t = model.layers[il].*k.field;
+                if ((a_t == nullptr) != (b_t == nullptr)) {
+                    uniform = false;
+                } else if (a_t && (a_t->type != b_t->type || a_t->ne[0] != b_t->ne[0] ||
+                                   a_t->ne[1] != b_t->ne[1] || a_t->ne[2] != b_t->ne[2])) {
+                    uniform = false;
+                }
+            }
+        }
+    }
+    if (shared && !uniform) {
+        fprintf(stderr, "moe pool: expert tensors differ between MoE layers, falling back to per-layer pools\n");
+        shared = false;
+    }
+    shared_ = shared;
+
+    // Cap the pool at the number of distinct experts it could ever hold: n_expert per layer, or
+    // n_expert * n_moe_layers when one pool serves every layer.
+    {
+        const uint64_t cap = shared_ ? (uint64_t) n_expert * index_.moe_layers.size() : n_expert;
+        if ((uint64_t) n_slots > cap) {
+            fprintf(stderr, "moe pool: %d slots exceeds the %llu distinct experts a %s pool can hold, clamping\n",
+                    n_slots, (unsigned long long) cap, shared_ ? "shared" : "per-layer");
+            n_slots = (int32_t) cap;
+        }
+    }
+
     for (size_t ls = 0; ls < index_.moe_layers.size(); ++ls) {
         const uint32_t il = index_.moe_layers[ls];
         auto & L = model.layers[il];
@@ -116,8 +147,20 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
             } else if (buft != src_buft) {
                 throw std::runtime_error("moe pool: expert tensors live in different buffer types; not supported yet");
             }
-            ggml_tensor * pt = ggml_new_tensor_3d(ctx_, src->type, src->ne[0], src->ne[1], n_slots);
-            ggml_format_name(pt, "moe_pool.blk.%u.%s", il, k.name);
+            ggml_tensor * pt = nullptr;
+            if (shared_) {
+                auto it = shared_tensors_.find(k.name);
+                if (it == shared_tensors_.end()) {
+                    pt = ggml_new_tensor_3d(ctx_, src->type, src->ne[0], src->ne[1], n_slots);
+                    ggml_format_name(pt, "moe_pool.shared.%s", k.name);
+                    shared_tensors_[k.name] = pt;
+                } else {
+                    pt = it->second;
+                }
+            } else {
+                pt = ggml_new_tensor_3d(ctx_, src->type, src->ne[0], src->ne[1], n_slots);
+                ggml_format_name(pt, "moe_pool.blk.%u.%s", il, k.name);
+            }
             pool_tensors.push_back(pt);
             sources.push_back(src);
         }
@@ -144,7 +187,13 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
             }
             index_.descs[ls * n_expert + e] = std::move(d);
         }
-        pools_.push_back(std::make_unique<moe::LayerPool>(il, (uint32_t) n_slots, pool_tensors));
+        if (shared_) {
+            if (pools_.empty()) {
+                pools_.push_back(std::make_unique<moe::LayerPool>(moe::LayerPool::ANY_LAYER, (uint32_t) n_slots, pool_tensors));
+            }
+        } else {
+            pools_.push_back(std::make_unique<moe::LayerPool>(il, (uint32_t) n_slots, pool_tensors));
+        }
         // swap the graph-visible tensors for the pool tensors
         size_t pi = 0;
         for (const auto & k : kinds) {
@@ -178,10 +227,11 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
     }
 
     const auto & d0 = index_.descs[0];
-    fprintf(stderr, "moe pool: compact expert pool: %zu MoE layers x %d slots, %zu tensors/expert, %.2f MiB/expert, "
-                   "pool buffer %.2f MiB (%s), store = %s\n",
-                   index_.moe_layers.size(), n_slots, d0.slices.size(), d0.total_bytes / (1024.0 * 1024.0),
-                   ggml_backend_buffer_get_size(buf_) / (1024.0 * 1024.0), ggml_backend_buft_name(buft), store_->name());
+    fprintf(stderr, "moe pool: %s pool, %zu MoE layers, %d slots%s, %zu tensors/expert, %.2f MiB/expert, "
+                    "pool buffer %.2f MiB (%s), store = %s\n",
+                    shared_ ? "shared" : "per-layer", index_.moe_layers.size(), n_slots,
+                    shared_ ? " total" : " per layer", d0.slices.size(), d0.total_bytes / (1024.0 * 1024.0),
+                    ggml_backend_buffer_get_size(buf_) / (1024.0 * 1024.0), ggml_backend_buft_name(buft), store_->name());
 
     model.hparams.moe_pool_active = true;
 }
@@ -257,6 +307,6 @@ void llama_moe_pool::on_slot_ids(struct ggml_tensor * t, uint32_t il) {
         }
         keys_buf_[i] = { il, (uint32_t) e };
     }
-    pools_[ls]->ensure(index_, *store_, keys_buf_, slots_buf_, stats_, clock_);
+    pools_[shared_ ? 0 : (size_t) ls]->ensure(index_, *store_, keys_buf_, slots_buf_, stats_, clock_);
     ggml_backend_tensor_set(t, slots_buf_.data(), 0, n * sizeof(int32_t));
 }

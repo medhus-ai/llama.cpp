@@ -2796,6 +2796,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_pool_slots              =*/ 0,
         /*.moe_store                   =*/ 0,
         /*.moe_verify                  =*/ false,
+        /*.moe_pool_shared             =*/ false,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

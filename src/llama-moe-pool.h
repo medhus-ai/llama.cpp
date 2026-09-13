@@ -10,6 +10,7 @@
 #include "moe-runtime/expert-runtime.h"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -19,7 +20,7 @@ struct ggml_context;
 
 struct llama_moe_pool {
     // store_mode: 0 = resident tensors (memory), 1 = positional reads from the model file
-    llama_moe_pool(llama_model & model, int32_t n_slots, int32_t store_mode, const std::string & model_path, bool verify);
+    llama_moe_pool(llama_model & model, int32_t n_slots, int32_t store_mode, const std::string & model_path, bool verify, bool shared);
     ~llama_moe_pool();
 
     llama_moe_pool(const llama_moe_pool &) = delete;
@@ -34,13 +35,15 @@ struct llama_moe_pool {
     void *                           user_ud = nullptr;
 
     int32_t n_slots = 0;
+    bool    shared_ = false;
 
 private:
     void on_slot_ids(struct ggml_tensor * t, uint32_t il);
 
     moe::ExpertIndex                             index_;
     std::unique_ptr<moe::ExpertStore>            store_;
-    std::vector<std::unique_ptr<moe::LayerPool>> pools_;   // by index_.layer_slot(il)
+    std::vector<std::unique_ptr<moe::LayerPool>> pools_;   // by index_.layer_slot(il), or one shared pool
+    std::map<std::string, ggml_tensor *>         shared_tensors_;
     moe::PoolStats                               stats_;
     uint64_t                                     clock_ = 0;
 
