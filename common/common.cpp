@@ -1693,9 +1693,16 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
+    mparams.moe_pool_slots = params.moe_pool_slots;
+    if (params.moe_pool_slots > 0 && !params.no_extra_bufts) {
+        // moe-stream-lab: repacked expert weights live in a buffer type that cannot be read back
+        // (no get_tensor), and the pool has to copy expert bytes out of them.
+        LOG_WRN("%s: --moe-pool-slots is active, disabling weight repacking (implies --no-repack)\n", __func__);
+        params.no_extra_bufts = true;
+    }
+    mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
-    mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
     if (params.kv_overrides.empty()) {

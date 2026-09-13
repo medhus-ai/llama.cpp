@@ -323,6 +323,9 @@ extern "C" {
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
+        // moe-stream-lab: serve routed experts from a compact pool of this many slots per MoE layer (0 = off)
+        int32_t moe_pool_slots;
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 

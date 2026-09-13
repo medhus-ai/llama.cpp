@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-moe-pool.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -2792,6 +2793,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.moe_pool_slots              =*/ 0,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

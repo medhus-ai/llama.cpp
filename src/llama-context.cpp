@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-pool.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -139,6 +140,14 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    if (model.moe_pool) {
+        // moe-stream-lab: the pool must observe the graph; chain any user callback behind it
+        model.moe_pool->user_cb   = cparams.cb_eval;
+        model.moe_pool->user_ud   = cparams.cb_eval_user_data;
+        cparams.cb_eval           = llama_moe_pool::cb_eval;
+        cparams.cb_eval_user_data = model.moe_pool.get();
+    }
 
     cparams.ctx_other = nullptr;
 
