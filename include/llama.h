@@ -335,7 +335,7 @@ extern "C" {
         bool     moe_sync_io;          // moe-stream-lab: force synchronous H2D copies (A/B against the async transfer stream)
         int32_t  moe_prefetch_k;       // moe-stream-lab: prerouter top-k candidates per token (0 = off)
         int32_t  moe_prefetch_lookahead; // moe-stream-lab: how many MoE layers ahead the prerouter predicts
-        const char * moe_prefetch_src; // moe-stream-lab: residual-stream tensor name prefix (NULL = nemotron_h_block_out)
+        const char * moe_prefetch_src; // moe-stream-lab: normed-input tensor name prefix the prerouter reads (NULL = attn_norm)
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
