@@ -255,6 +255,21 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    if (model.moe_pool) {
+        // moe-stream-lab: a ubatch may request up to n_expert_used distinct experts per token per layer, and
+        // the pool must hold all of them at once (ADR 0007: split tokens, never the GEMM). Cap n_ubatch.
+        const uint32_t n_used = model.hparams.n_expert_used_max();
+        const uint32_t cap    = n_used > 0 ? std::max<uint32_t>(1, (uint32_t) model.moe_pool->n_slots / n_used) : cparams.n_ubatch;
+        if (cparams.n_ubatch > cap) {
+            LLAMA_LOG_WARN("%s: expert pool has %d slots per layer and the model routes %u experts/token: "
+                           "capping n_ubatch %u -> %u\n", __func__, model.moe_pool->n_slots, n_used, cparams.n_ubatch, cap);
+            cparams.n_ubatch = cap;
+            if (cparams.n_batch < cparams.n_ubatch) {
+                cparams.n_batch = cparams.n_ubatch;
+            }
+        }
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
