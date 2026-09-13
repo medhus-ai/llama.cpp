@@ -66,6 +66,45 @@ public:
     const char * name() const override { return "memory"; }
 };
 
+// Reads expert bytes straight from the model file with positional reads (no mmap, no page-cache hints).
+// Requires TensorSlice::file_offset to be the absolute offset of the expert's bytes in the file.
+class BufferedFileExpertStore : public ExpertStore {
+public:
+    explicit BufferedFileExpertStore(const std::string & path);
+    ~BufferedFileExpertStore() override;
+
+    void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
+    const char * name() const override { return "file"; }
+
+    uint64_t reads() const { return reads_; }
+    uint64_t bytes() const { return bytes_; }
+
+private:
+    std::string path_;
+    int         fd_ = -1;
+    uint64_t    reads_ = 0;
+    uint64_t    bytes_ = 0;
+};
+
+// Reads every slice through both stores and aborts on the first differing byte. Used by --moe-verify to
+// prove that a new storage path returns exactly the bytes the reference path returns.
+class VerifyingExpertStore : public ExpertStore {
+public:
+    VerifyingExpertStore(std::unique_ptr<ExpertStore> primary, std::unique_ptr<ExpertStore> reference);
+
+    void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
+    const char * name() const override { return name_.c_str(); }
+
+    uint64_t checked() const { return checked_; }
+
+private:
+    std::unique_ptr<ExpertStore> primary_;
+    std::unique_ptr<ExpertStore> reference_;
+    std::vector<uint8_t>         ref_buf_;
+    std::string                  name_;
+    uint64_t                     checked_ = 0;
+};
+
 enum class SlotState : uint8_t { FREE, LOADING, READY, IN_USE };
 
 struct Slot {

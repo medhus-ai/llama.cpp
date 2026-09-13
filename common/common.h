@@ -518,6 +518,8 @@ struct common_params {
 
     // llama-debug specific options
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
+    bool        moe_verify     = false;     // moe-stream-lab: byte-compare every expert read against resident tensors // NOLINT
+    int32_t     moe_store      = 0;         // moe-stream-lab: 0 = resident tensors, 1 = read from the model file  // NOLINT
     int32_t     moe_pool_slots = 0;         // moe-stream-lab: compact expert pool slots per MoE layer (0 = off)  // NOLINT
     std::string moe_trace_file;             // moe-stream-lab: JSONL routing trace of selected experts       // NOLINT
     bool        save_logits       = false;  // whether to save logits to files                              // NOLINT

@@ -4534,6 +4534,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--moe-verify"},
+        "moe-stream-lab: byte-compare every expert read against the resident tensors (slow, correctness only)",
+        [](common_params & params) {
+            params.moe_verify = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_VERIFY"));
+    add_opt(common_arg(
+        {"--moe-store"}, "MODE",
+        "moe-stream-lab: where the expert pool gets its bytes: memory (resident tensors, default) or file (positional reads from the model file)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "memory") { params.moe_store = 0; }
+            else if (value == "file")   { params.moe_store = 1; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_MOE_STORE"));
+    add_opt(common_arg(
         {"--moe-pool-slots"}, "N",
         "moe-stream-lab: serve routed experts from a compact pool of N slots per MoE layer (0 = off, stock)",
         [](common_params & params, int value) {
