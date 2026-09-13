@@ -4534,6 +4534,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--moe-pool-slots"}, "N",
+        "moe-stream-lab: serve routed experts from a compact pool of N slots per MoE layer (0 = off, stock)",
+        [](common_params & params, int value) {
+            params.moe_pool_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_POOL_SLOTS"));
+    add_opt(common_arg(
         {"--moe-trace"}, "FNAME",
         "write a JSONL trace of routed-expert selections per token and layer (moe-stream-lab M1; default: disabled)",
         [](common_params & params, const std::string & value) {

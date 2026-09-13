@@ -690,6 +690,9 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    // moe-stream-lab: compact expert pool (nullptr = stock behaviour)
+    std::unique_ptr<struct llama_moe_pool> moe_pool;
+
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models
