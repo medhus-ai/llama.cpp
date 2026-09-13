@@ -512,6 +512,8 @@ struct llama_hparams {
     // Kept at the end of the struct on purpose: inserting it between existing members shifts every
     // following field, including the per-layer arrays read in hot paths.
     bool     moe_pool_active = false;
+    int32_t  moe_prefetch_k = 0;         // moe-stream-lab: in-graph prerouter top-k (0 = off)
+    int32_t  moe_prefetch_lookahead = 1; // moe-stream-lab: MoE layers of lead for the in-graph prerouter
 };
 
 static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams must be trivially copyable");
