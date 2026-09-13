@@ -4534,6 +4534,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--moe-io-threads"}, "N",
+        "moe-stream-lab: number of workers fetching the missing experts of one ubatch (default 1 = sequential, for A/B)",
+        [](common_params & params, int value) {
+            params.moe_io_threads = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_IO_THREADS"));
+    add_opt(common_arg(
         {"--moe-pool-shared"},
         "moe-stream-lab: share one expert pool across all MoE layers (--moe-pool-slots then counts total slots) instead of one pool per layer",
         [](common_params & params) {

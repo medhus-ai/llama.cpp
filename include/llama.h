@@ -329,6 +329,7 @@ extern "C" {
         int32_t moe_store;
         bool    moe_verify;   // moe-stream-lab: byte-compare every expert read against the resident tensors
         bool    moe_pool_shared; // moe-stream-lab: one pool shared by all MoE layers instead of one per layer
+        int32_t moe_io_threads;  // moe-stream-lab: workers fetching the misses of one ubatch (1 = sequential)
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
