@@ -381,6 +381,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                                                          params.moe_host_cache_bytes,
                                                          params.moe_prefetch_k, params.moe_prefetch_lookahead, params.moe_prefetch_src);
             model->moe_pool->async_enabled_ = !params.moe_sync_io;
+            model->moe_pool->prefetch_margin_ = params.moe_prefetch_margin;
         }
 
         return {0, model_ptr.release()};

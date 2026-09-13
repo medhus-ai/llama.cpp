@@ -4541,6 +4541,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH"));
     add_opt(common_arg(
+        {"--moe-prefetch-margin"}, "M",
+        "moe-stream-lab: only prefetch candidates whose router probability is within M (0..1) of the 6th-best; 0 = fixed top-K",
+        [](common_params & params, const std::string & value) {
+            params.moe_prefetch_margin = std::stof(value);
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-prefetch-lookahead"}, "N",
         "moe-stream-lab: how many MoE layers ahead the prerouter predicts (default 1)",
         [](common_params & params, int value) {

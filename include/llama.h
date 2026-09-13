@@ -336,6 +336,7 @@ extern "C" {
         int32_t  moe_prefetch_k;       // moe-stream-lab: prerouter top-k candidates per token (0 = off)
         int32_t  moe_prefetch_lookahead; // moe-stream-lab: how many MoE layers ahead the prerouter predicts
         const char * moe_prefetch_src; // moe-stream-lab: normed-input tensor name prefix the prerouter reads (NULL = attn_norm)
+        float    moe_prefetch_margin;  // moe-stream-lab: confidence margin for prefetch candidates (0 = fixed top-k)
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
