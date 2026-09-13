@@ -518,6 +518,7 @@ struct common_params {
 
     // llama-debug specific options
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
+    uint64_t    moe_host_cache_bytes = 0;   // moe-stream-lab: RAM cache of expert bundles (0 = off)                  // NOLINT
     std::string moe_pack_path;              // moe-stream-lab: moepack sidecar path (empty = <model>.moepack)      // NOLINT
     int32_t     moe_io_threads = 1;         // moe-stream-lab: workers fetching the misses of one ubatch          // NOLINT
     bool        moe_pool_shared = false;   // moe-stream-lab: one pool for all MoE layers instead of one each      // NOLINT

@@ -272,6 +272,80 @@ void PackExpertStore::read_bundle(const ExpertDescriptor & e, const std::vector<
     }
 }
 
+CachingExpertStore::CachingExpertStore(std::unique_ptr<ExpertStore> inner, uint64_t capacity_bytes)
+    : inner_(std::move(inner)), capacity_(capacity_bytes) {
+    name_ = std::string("hostcache(") + inner_->name() + ")";
+}
+
+const CachingExpertStore::Entry * CachingExpertStore::find_locked(ExpertKey k) const {
+    auto it = map_.find({ k.layer, k.expert });
+    return it == map_.end() ? nullptr : &it->second;
+}
+
+void CachingExpertStore::insert_locked(ExpertKey k, std::vector<uint8_t> && bytes) {
+    const uint64_t sz = bytes.size();
+    if (sz > capacity_) {
+        return;   // cannot hold even one bundle: behave as a pass-through
+    }
+    while (used_ + sz > capacity_ && !map_.empty()) {
+        // evict least recently used (linear scan; the map holds at most a few thousand bundles)
+        auto victim = map_.begin();
+        for (auto it = map_.begin(); it != map_.end(); ++it) {
+            if (it->second.last_use < victim->second.last_use) {
+                victim = it;
+            }
+        }
+        used_ -= victim->second.bytes.size();
+        map_.erase(victim);
+        stats_.evictions++;
+    }
+    Entry & e = map_[{ k.layer, k.expert }];
+    used_ -= e.bytes.size();
+    e.bytes = std::move(bytes);
+    e.last_use = ++clock_;
+    used_ += sz;
+    stats_.bytes_inserted += sz;
+}
+
+void CachingExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
+    const TensorSlice & s = e.slices.at(slice);
+    uint64_t off = 0;
+    for (size_t i = 0; i < slice; ++i) {
+        off += e.slices[i].bytes;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (const Entry * en = find_locked(e.key)) {
+            memcpy(dst, en->bytes.data() + off, s.bytes);
+            const_cast<Entry *>(en)->last_use = ++clock_;
+            stats_.hits++;
+            stats_.bytes_from_cache += s.bytes;
+            return;
+        }
+        stats_.misses++;
+    }
+    // miss: fetch the whole bundle from the inner store (one read per slice), serve, and write through
+    std::vector<uint8_t> bundle(e.total_bytes);
+    uint64_t o = 0;
+    for (size_t i = 0; i < e.slices.size(); ++i) {
+        inner_->read_slice(e, i, bundle.data() + o);
+        o += e.slices[i].bytes;
+    }
+    memcpy(dst, bundle.data() + off, s.bytes);
+    std::lock_guard<std::mutex> lock(mtx_);
+    insert_locked(e.key, std::move(bundle));
+}
+
+CachingExpertStore::Stats CachingExpertStore::stats() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return stats_;
+}
+
+uint64_t CachingExpertStore::resident_bytes() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return used_;
+}
+
 VerifyingExpertStore::VerifyingExpertStore(std::unique_ptr<ExpertStore> primary, std::unique_ptr<ExpertStore> reference)
     : primary_(std::move(primary)), reference_(std::move(reference)) {
     name_ = std::string("verify(") + primary_->name() + " vs " + reference_->name() + ")";

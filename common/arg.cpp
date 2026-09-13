@@ -4534,6 +4534,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--moe-host-cache"}, "SIZE",
+        "moe-stream-lab: RAM cache of expert bundles in front of storage, e.g. 4G or 512M (default: off)",
+        [](common_params & params, const std::string & value) {
+            char * end = nullptr;
+            double v = strtod(value.c_str(), &end);
+            uint64_t mult = 1;
+            if (end && *end) {
+                switch (*end) {
+                    case 'G': case 'g': mult = 1ull << 30; break;
+                    case 'M': case 'm': mult = 1ull << 20; break;
+                    case 'K': case 'k': mult = 1ull << 10; break;
+                    default: throw std::invalid_argument("invalid size suffix");
+                }
+            }
+            params.moe_host_cache_bytes = (uint64_t) (v * (double) mult);
+        }
+    ).set_env("LLAMA_ARG_MOE_HOST_CACHE"));
+    add_opt(common_arg(
         {"--moe-pack"}, "FNAME",
         "moe-stream-lab: moepack sidecar to read experts from with --moe-store pack (default: <model>.moepack)",
         [](common_params & params, const std::string & value) {
