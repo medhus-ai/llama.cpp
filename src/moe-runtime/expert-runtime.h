@@ -100,6 +100,9 @@ public:
     void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
     const char * name() const override { return direct_ ? "direct" : "direct(fallback:buffered)"; }
 
+    // Read [file_offset, file_offset+bytes) into dst through the aligned staging buffer (thread-safe).
+    void read_range(uint64_t file_offset, uint64_t bytes, void * dst, const char * what);
+
     uint64_t reads() const { return reads_.load(); }
     uint64_t bytes_read() const { return bytes_read_.load(); }   // bytes actually pulled from the device
     uint64_t bytes_used() const { return bytes_used_.load(); }   // bytes the caller asked for
@@ -123,6 +126,31 @@ private:
     std::atomic<uint64_t> reads_{0};
     std::atomic<uint64_t> bytes_read_{0};
     std::atomic<uint64_t> bytes_used_{0};
+};
+
+// Reads expert bytes from a moepack sidecar (tools/moe-pack): every expert is one contiguous, aligned
+// bundle, so a whole expert is fetched with a single O_DIRECT read instead of one unaligned read per
+// tensor. TensorSlice::file_offset must point into the pack (set by the adapter from the .moeidx).
+// Implemented on top of DirectIOExpertStore's aligned cover-range reader; read_bundle() fetches all
+// slices of an expert at once when they are adjacent in the pack.
+class PackExpertStore : public ExpertStore {
+public:
+    explicit PackExpertStore(const std::string & pack_path, bool direct = true);
+
+    void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
+    const char * name() const override { return direct_ ? "pack(direct)" : "pack(buffered)"; }
+
+    // Whole-bundle fetch: slices must be adjacent (slice i+1 offset == slice i offset + bytes).
+    // dsts[i] receives slice i. Falls back to per-slice reads if not adjacent.
+    void read_bundle(const ExpertDescriptor & e, const std::vector<void *> & dsts);
+
+    uint64_t reads() const { return inner_->reads(); }
+    uint64_t bytes_read() const { return inner_->bytes_read(); }
+    uint64_t bytes_used() const { return inner_->bytes_used(); }
+
+private:
+    std::unique_ptr<DirectIOExpertStore> inner_;
+    bool direct_ = true;
 };
 
 // Reads every slice through both stores and aborts on the first differing byte. Used by --moe-verify to
@@ -196,6 +224,7 @@ private:
     int find(ExpertKey k) const;
     int pick_victim() const;
     void load(const ExpertIndex & idx, ExpertStore & store, ExpertKey k, int slot, PoolStats & stats);
+    void fetch_into(ExpertStore & store, const ExpertDescriptor & d, int slot, std::vector<uint8_t> & staging);
     // fetch several (key, slot) pairs, using io_threads_ workers; byte counts are accumulated per worker
     void load_many(const ExpertIndex & idx, ExpertStore & store,
                    const std::vector<std::pair<ExpertKey, int>> & work, PoolStats & stats);

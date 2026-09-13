@@ -10,11 +10,12 @@
 
 #include <cstdio>
 #include <cstring>
+#include <sys/stat.h>
 #include <stdexcept>
 
 static const char * SLOT_IDS_PREFIX = "ffn_moe_slot_ids-";
 
-llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads)
+llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads, const std::string & pack_path)
     : n_slots(n_slots_) {
     if (n_slots <= 0) {
         throw std::runtime_error("moe pool: n_slots must be > 0");
@@ -175,7 +176,7 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
                 sl.bytes  = src->nb[2];
                 sl.offset = (uint64_t) e * src->nb[2];
                 sl.type   = src->type;
-                if (meta) {
+                if (meta && store_mode != 3) {
                     const int64_t ti = gguf_find_tensor(meta, sl.name.c_str());
                     if (ti < 0) {
                         throw std::runtime_error("moe pool: tensor not found in GGUF: " + sl.name);
@@ -213,15 +214,42 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         gguf_free(meta);
     }
 
+    // moepack layout (tools/moe-pack/moe_pack.py): 4 KiB header, then for each MoE layer in ascending order,
+    // for each expert, the slices in kind order (up, down, gate as present), each bundle padded to `align`.
+    // The layout is deterministic, so the offsets are computed here and checked against the file size; the
+    // .moeidx JSON with per-slice hashes is the verification artifact on the Python side.
+    if (store_mode == 3) {
+        const uint64_t align = 4096;
+        struct stat st;
+        if (stat(pack_path.c_str(), &st) != 0) {
+            throw std::runtime_error("moe pool: cannot stat moepack " + pack_path + " (run tools/moe-pack/moe_pack.py)");
+        }
+        const uint64_t bundle_payload = index_.descs[0].total_bytes;
+        const uint64_t bundle_len = ((bundle_payload + align - 1) / align) * align;
+        const uint64_t expected = align + bundle_len * (uint64_t) index_.descs.size();
+        if ((uint64_t) st.st_size != expected) {
+            throw std::runtime_error("moe pool: moepack size " + std::to_string(st.st_size) + " != expected " +
+                                     std::to_string(expected) + " for this model's expert layout; re-pack it");
+        }
+        for (size_t i = 0; i < index_.descs.size(); ++i) {
+            uint64_t off = align + bundle_len * i;
+            for (auto & sl : index_.descs[i].slices) {
+                sl.file_offset = off;
+                off += sl.bytes;
+            }
+        }
+    }
+
     switch (store_mode) {
         case 0:  store_ = std::make_unique<moe::MemoryExpertStore>();               break;
         case 1:  store_ = std::make_unique<moe::BufferedFileExpertStore>(model_path); break;
         case 2:  store_ = std::make_unique<moe::DirectIOExpertStore>(model_path);   break;
+        case 3:  store_ = std::make_unique<moe::PackExpertStore>(pack_path);        break;
         default: throw std::runtime_error("moe pool: unknown store mode " + std::to_string(store_mode));
     }
     if (verify) {
         if (store_mode == 0) {
-            throw std::runtime_error("moe pool: --moe-verify needs a non-reference store (use --moe-store file or direct)");
+            throw std::runtime_error("moe pool: --moe-verify needs a non-reference store (use --moe-store file, direct or pack)");
         }
         store_ = std::make_unique<moe::VerifyingExpertStore>(std::move(store_), std::make_unique<moe::MemoryExpertStore>());
     }
