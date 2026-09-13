@@ -17,6 +17,9 @@
 
 static const char * SLOT_IDS_PREFIX = "ffn_moe_slot_ids-";
 static const char * PREFETCH_IDS_PREFIX = "ffn_moe_prefetch_ids-";
+static const char * PREFETCH_PROBS_PREFIX = "ffn_moe_prefetch_probs-";
+static const char * PREFETCH_ENTRY_IDS_PREFIX = "ffn_moe_prefetch_entry_ids-";
+static const char * PREFETCH_ENTRY_PROBS_PREFIX = "ffn_moe_prefetch_entry_probs-";
 
 llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads, const std::string & pack_path, uint64_t host_cache_bytes,
                                int32_t prefetch_k, int32_t prefetch_lookahead, const char * prefetch_src)
@@ -423,10 +426,14 @@ bool llama_moe_pool::cb_eval(struct ggml_tensor * t, bool ask, void * user_data)
     if (blk >= 0 && self->index_.layer_slot((uint32_t) blk) < 0) {
         blk = -1;   // only the normed input of MoE layers; those splits already exist for the slot-id tensor
     }
-    const int pf = (self->prerouter_.enabled && self->prerouter_in_graph_) ? parse_prefixed_layer(t->name, std::string(PREFETCH_IDS_PREFIX)) : -1;
+    const bool ig = self->prerouter_.enabled && self->prerouter_in_graph_;
+    const int pf  = ig ? parse_prefixed_layer(t->name, std::string(PREFETCH_IDS_PREFIX)) : -1;
+    const int pp  = ig ? parse_prefixed_layer(t->name, std::string(PREFETCH_PROBS_PREFIX)) : -1;
+    const int pe  = ig ? parse_prefixed_layer(t->name, std::string(PREFETCH_ENTRY_IDS_PREFIX)) : -1;
+    const int pep = ig ? parse_prefixed_layer(t->name, std::string(PREFETCH_ENTRY_PROBS_PREFIX)) : -1;
 
     if (ask) {
-        bool need = il >= 0 || blk >= 0 || pf >= 0;
+        bool need = il >= 0 || blk >= 0 || pf >= 0 || pp >= 0 || pe >= 0 || pep >= 0;
         if (self->user_cb) {
             need = self->user_cb(t, true, self->user_ud) || need;
         }
@@ -441,6 +448,16 @@ bool llama_moe_pool::cb_eval(struct ggml_tensor * t, bool ask, void * user_data)
     }
     if (pf >= 0) {
         self->on_prefetch_ids(t, (uint32_t) pf);
+    }
+    if (pe >= 0) {   // entry prediction: the named layer IS the target
+        self->pending_entry_ = true;
+        self->on_prefetch_ids(t, (uint32_t) pe);
+    }
+    if (pp >= 0) {
+        self->on_prefetch_probs(t, (uint32_t) pp, false);
+    }
+    if (pep >= 0) {
+        self->on_prefetch_probs(t, (uint32_t) pep, true);
     }
     if (self->user_cb) {
         return self->user_cb(t, false, self->user_ud);
@@ -580,27 +597,29 @@ void llama_moe_pool::on_residual(struct ggml_tensor * t, uint32_t layer) {
     prerouter_.cv.notify_all();
 }
 
-// In-graph prerouter output for MoE layer `layer`: I32 [k, n_tokens] candidate experts of the target layer
-void llama_moe_pool::on_prefetch_ids(struct ggml_tensor * t, uint32_t layer) {
-    if (!prerouter_.enabled || t->type != GGML_TYPE_I32) {
-        return;
-    }
-    const int ls = index_.layer_slot(layer);
-    if (ls < 0) {
-        return;
-    }
-    const size_t target = (size_t) ls + (size_t) prerouter_.lookahead;
-    if (target >= index_.moe_layers.size()) {
-        return;
-    }
-    const uint32_t il_t = index_.moe_layers[target];
-    const size_t n = (size_t) ggml_nelements(t);
-    std::vector<int32_t> ids(n);
-    ggml_backend_tensor_get(t, ids.data(), 0, n * sizeof(int32_t));
+void llama_moe_pool::issue_prefetch(uint32_t il_t, const std::vector<int32_t> & ids, const std::vector<float> * probs, int64_t n_tok) {
+    const uint32_t n_used = std::max<uint32_t>(1, index_.n_expert ? (uint32_t) (ids.size() / std::max<int64_t>(1, n_tok)) : 1);
+    (void) n_used;
     std::vector<uint32_t> wanted;
-    wanted.reserve(n);
-    for (int32_t e : ids) {
-        if (e >= 0 && (uint32_t) e < index_.n_expert) {
+    wanted.reserve(ids.size());
+    const size_t k = n_tok > 0 ? ids.size() / (size_t) n_tok : ids.size();
+    for (int64_t tk = 0; tk < n_tok; ++tk) {
+        // candidates are sorted by probability within a token (argsort_top_k); the margin keeps those whose
+        // probability is within (1 - margin) of the n_expert_used-th best - the ones that could plausibly
+        // make the real top-6 - and drops the tail that only pads the queue
+        float thresh = -1.0f;
+        if (probs && prefetch_margin_ > 0.0f) {
+            const size_t ref = std::min<size_t>(k, 6) - 1;
+            thresh = (*probs)[(size_t) tk * k + ref] * (1.0f - prefetch_margin_);
+        }
+        for (size_t j = 0; j < k; ++j) {
+            const int32_t e = ids[(size_t) tk * k + j];
+            if (e < 0 || (uint32_t) e >= index_.n_expert) {
+                continue;
+            }
+            if (probs && prefetch_margin_ > 0.0f && (*probs)[(size_t) tk * k + j] < thresh) {
+                break;   // sorted: everything after is lower
+            }
             wanted.push_back((uint32_t) e);
         }
     }
@@ -610,7 +629,7 @@ void llama_moe_pool::on_prefetch_ids(struct ggml_tensor * t, uint32_t layer) {
 
     auto & pool = pools_[shared_ ? 0 : (size_t) index_.layer_slot(il_t)];
     std::lock_guard<std::mutex> lock(prerouter_.mtx);
-    const size_t cap = 4 * (size_t) prerouter_.k * (size_t) std::max<int64_t>(1, t->ne[1]);
+    const size_t cap = 4 * (size_t) prerouter_.k * (size_t) std::max<int64_t>(1, n_tok);
     if (prerouter_.queue.size() > cap) {
         prerouter_.dropped += prerouter_.queue.size();
         prerouter_.queue.clear();
@@ -624,6 +643,56 @@ void llama_moe_pool::on_prefetch_ids(struct ggml_tensor * t, uint32_t layer) {
         prerouter_.issued++;
     }
     prerouter_.cv.notify_all();
+}
+
+// In-graph prerouter output for MoE layer `layer`: I32 [k, n_tokens]. For the regular tensor the target is
+// `lookahead` MoE layers ahead; for the entry tensor (pending_entry_) the named layer is the target.
+void llama_moe_pool::on_prefetch_ids(struct ggml_tensor * t, uint32_t layer) {
+    if (!prerouter_.enabled || t->type != GGML_TYPE_I32) {
+        pending_entry_ = false;
+        return;
+    }
+    const int ls = index_.layer_slot(layer);
+    if (ls < 0) {
+        pending_entry_ = false;
+        return;
+    }
+    uint32_t il_t;
+    if (pending_entry_) {
+        il_t = layer;
+    } else {
+        const size_t target = (size_t) ls + (size_t) prerouter_.lookahead;
+        if (target >= index_.moe_layers.size()) {
+            return;
+        }
+        il_t = index_.moe_layers[target];
+    }
+    const size_t n = (size_t) ggml_nelements(t);
+    pending_ids_.resize(n);
+    ggml_backend_tensor_get(t, pending_ids_.data(), 0, n * sizeof(int32_t));
+    pending_layer_ = il_t;
+    pending_ntok_  = t->ne[1];
+    if (prefetch_margin_ <= 0.0f) {
+        issue_prefetch(il_t, pending_ids_, nullptr, pending_ntok_);
+        pending_layer_ = UINT32_MAX;
+        pending_entry_ = false;
+    }
+    // else: wait for the probs tensor, which the graph computes right after the ids
+}
+
+void llama_moe_pool::on_prefetch_probs(struct ggml_tensor * t, uint32_t layer, bool entry) {
+    (void) layer; (void) entry;
+    if (pending_layer_ == UINT32_MAX || t->type != GGML_TYPE_F32) {
+        return;
+    }
+    const size_t n = (size_t) ggml_nelements(t);
+    std::vector<float> probs(n);
+    ggml_backend_tensor_get(t, probs.data(), 0, n * sizeof(float));
+    if (n == pending_ids_.size()) {
+        issue_prefetch(pending_layer_, pending_ids_, &probs, pending_ntok_);
+    }
+    pending_layer_ = UINT32_MAX;
+    pending_entry_ = false;
 }
 
 void llama_moe_pool::on_slot_ids(struct ggml_tensor * t, uint32_t il) {

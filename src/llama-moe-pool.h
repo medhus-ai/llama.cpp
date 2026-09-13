@@ -69,6 +69,11 @@ struct llama_moe_pool {
     void init_prerouter(llama_model & model, int k, int lookahead, const std::string & src_prefix);
     void on_residual(struct ggml_tensor * t, uint32_t block);
     void on_prefetch_ids(struct ggml_tensor * t, uint32_t layer);   // in-graph prerouter output
+    void on_prefetch_probs(struct ggml_tensor * t, uint32_t layer, bool entry);
+    void issue_prefetch(uint32_t il_t, const std::vector<int32_t> & ids, const std::vector<float> * probs, int64_t n_tok);
+    float prefetch_margin_ = 0.0f;   // item 2: keep candidate i only if prob_i >= prob_of_(n_used)th * (1 - margin); 0 = off
+    std::vector<int32_t> pending_ids_;   // ids seen, waiting for their probs tensor (same callback batch)
+    uint32_t pending_layer_ = UINT32_MAX; bool pending_entry_ = false; int64_t pending_ntok_ = 0;
     bool prerouter_in_graph_ = true;
 
     bool    shared_ = false;

@@ -197,6 +197,30 @@ llama_model_nemotron_h::graph::graph(const llama_model & model, const llm_graph_
         struct ggml_tensor * inpSA = inpL;
 
         // norm
+        if (il == 0 && hparams.moe_pool_active && hparams.moe_prefetch_k > 0) {
+            // moe-stream-lab item 3: the next token's embedding is known before any block runs; run the
+            // first MoE layer's router on it so its experts are pulled in during blocks 0..first-1
+            int first = -1;
+            for (int j = 0; j < (int) model.layers.size(); ++j) {
+                if (model.layers[j].ffn_gate_inp) { first = j; break; }
+            }
+            if (first >= 0 && model.layers[first].attn_norm) {
+                ggml_tensor * xe = build_norm(inpL, model.layers[first].attn_norm, NULL, LLM_NORM_RMS, first);
+                ggml_tensor * pe = ggml_mul_mat(ctx0, model.layers[first].ffn_gate_inp, xe);
+                pe = ggml_sigmoid(ctx0, pe);
+                if (model.layers[first].ffn_exp_probs_b) {
+                    pe = ggml_add(ctx0, pe, model.layers[first].ffn_exp_probs_b);
+                }
+                const int ke = std::min<int>(hparams.moe_prefetch_k, (int) pe->ne[0]);
+                ggml_tensor * eids = ggml_argsort_top_k(ctx0, pe, ke);
+                cb(eids, "ffn_moe_prefetch_entry_ids", first);
+                ggml_build_forward_expand(gf, eids);
+                ggml_tensor * pe3 = ggml_reshape_3d(ctx0, pe, 1, pe->ne[0], pe->ne[1]);
+                ggml_tensor * ev = ggml_get_rows(ctx0, pe3, eids);
+                cb(ev, "ffn_moe_prefetch_entry_probs", first);
+                ggml_build_forward_expand(gf, ev);
+            }
+        }
         cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
@@ -313,6 +337,11 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(ggml_tensor * cur, 
                 ggml_tensor * pids = ggml_argsort_top_k(ctx0, pl, k);   // [k, n_tokens], I32
                 cb(pids, "ffn_moe_prefetch_ids", il);
                 ggml_build_forward_expand(gf, pids);
+                // the candidates' probabilities, so the pool can apply a confidence margin (item 2)
+                ggml_tensor * pl3  = ggml_reshape_3d(ctx0, pl, 1, pl->ne[0], pl->ne[1]);
+                ggml_tensor * pval = ggml_get_rows(ctx0, pl3, pids);      // [1, k, n_tokens]
+                cb(pval, "ffn_moe_prefetch_probs", il);
+                ggml_build_forward_expand(gf, pval);
             }
         }
 
