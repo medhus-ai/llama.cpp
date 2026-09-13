@@ -243,13 +243,16 @@ public:
     ~FetchWorkers();
     uint32_t size() const { return (uint32_t) threads_.size(); }
     void run(size_t n, const std::function<void(size_t)> & fn);
+    // non-blocking form: start(); ... wait() rethrows the first worker error
+    void start(size_t n, const std::function<void(size_t)> & fn);
+    void wait();
 
 private:
     void loop();
     std::vector<std::thread> threads_;
     std::mutex mtx_;
     std::condition_variable cv_, done_cv_;
-    const std::function<void(size_t)> * fn_ = nullptr;
+    std::function<void(size_t)> fn_;   // owned copy: callers may pass temporaries to start()
     size_t n_ = 0, next_ = 0, done_ = 0;
     uint64_t gen_ = 0;
     bool stop_ = false;
@@ -300,6 +303,14 @@ public:
     // sequential path, so the effect of parallel fetch can be measured by turning it off.
     void set_io_threads(uint32_t n);
     void set_host_pool(bool host) { host_pool_ = host; }
+    // Device pools: copies are issued asynchronously on `transfer` (a backend instance with its own stream)
+    // and `compute` (the context's backend for this device) waits on an event before the graph continues.
+    // The pinned source slabs stay referenced until the next call proves the copies completed.
+    void set_device_backends(ggml_backend_t transfer, ggml_backend_t compute, ggml_backend_dev_t dev);
+    bool async_transfer() const { return transfer_ != nullptr && compute_ != nullptr; }
+    // Wait for any in-flight copies and release their source slabs (also called at destruction).
+    void drain_transfers();
+    ~LayerPool();
     uint32_t io_threads() const { return io_threads_; }
 
     uint32_t n_slots() const { return (uint32_t) slots_.size(); }
@@ -319,6 +330,13 @@ private:
     uint32_t io_threads_ = 1;
     std::unique_ptr<FetchWorkers> workers_;
     bool     host_pool_  = true;   // false when the pool tensors live in device memory
+    ggml_backend_t       transfer_ = nullptr;
+    ggml_backend_t       compute_  = nullptr;
+    ggml_backend_event_t event_    = nullptr;
+    bool                 event_pending_ = false;
+    std::vector<ExpertDescriptor>          pending_release_;   // bundles held in a CachingExpertStore
+    class CachingExpertStore *             pending_cache_ = nullptr;
+    std::vector<std::vector<uint8_t>>      pending_staged_;    // pageable staging kept alive until drained
     std::vector<Slot> slots_;
     std::vector<ggml_tensor *> tensors_;  // pool tensor per slice kind, same order as descriptor slices
     std::vector<uint8_t> staging_;

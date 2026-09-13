@@ -298,6 +298,13 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         pool->set_io_threads((uint32_t) n_io);
     }
 
+    if (!all_host) {
+        device_ = ggml_backend_buft_get_device(buft);
+        if (device_) {
+            transfer_backend_ = ggml_backend_dev_init(device_, nullptr);
+        }
+    }
+
     const auto & d0 = index_.descs[0];
     fprintf(stderr, "moe pool: %s pool, %zu MoE layers, %d slots%s, %zu tensors/expert, %.2f MiB/expert, "
                     "pool buffer %.2f MiB (%s), store = %s, io threads = %d\n",
@@ -308,10 +315,26 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
     model.hparams.moe_pool_active = true;
 }
 
+void llama_moe_pool::attach_compute_backend(ggml_backend_t compute) {
+    if (!async_enabled_ || !transfer_backend_ || !compute) {
+        return;
+    }
+    for (auto & pool : pools_) {
+        pool->set_device_backends(transfer_backend_, compute, device_);
+    }
+    fprintf(stderr, "moe pool: async H2D on a dedicated transfer stream (%s)\n", ggml_backend_name(transfer_backend_));
+}
+
 llama_moe_pool::~llama_moe_pool() {
+    for (auto & pool : pools_) {
+        pool->drain_transfers();
+    }
     fprintf(stderr, "moe pool stats: %s\n", stats_json().c_str());
     for (auto * b : bufs_) {
         ggml_backend_buffer_free(b);
+    }
+    if (transfer_backend_) {
+        ggml_backend_free(transfer_backend_);
     }
     for (auto & [bt, c] : ctx_by_buft_) {
         (void) bt;
@@ -392,6 +415,12 @@ void llama_moe_pool::on_slot_ids(struct ggml_tensor * t, uint32_t il) {
             throw std::runtime_error("moe pool: routed expert id out of range: " + std::to_string(e));
         }
         keys_buf_[i] = { il, (uint32_t) e };
+    }
+    // The scheduler synchronised the compute backend before this callback, so every previously issued
+    // transfer (in any layer's pool) has completed: release their pinned source slabs now, globally.
+    // Holding them until each pool's own next batch could pin the whole host cache and deadlock.
+    for (auto & pool : pools_) {
+        pool->drain_transfers();
     }
     pools_[shared_ ? 0 : (size_t) ls]->ensure(index_, *store_, keys_buf_, slots_buf_, stats_, clock_);
     ggml_backend_tensor_set(t, slots_buf_.data(), 0, n * sizeof(int32_t));
