@@ -272,68 +272,160 @@ void PackExpertStore::read_bundle(const ExpertDescriptor & e, const std::vector<
     }
 }
 
-CachingExpertStore::CachingExpertStore(std::unique_ptr<ExpertStore> inner, uint64_t capacity_bytes)
-    : inner_(std::move(inner)), capacity_(capacity_bytes) {
+CachingExpertStore::CachingExpertStore(std::unique_ptr<ExpertStore> inner, uint64_t capacity_bytes, uint64_t bundle_bytes)
+    : inner_(std::move(inner)), bundle_bytes_(bundle_bytes) {
+    n_slots_ = bundle_bytes ? capacity_bytes / bundle_bytes : 0;
+    if (n_slots_ > 0) {
+        void * p = nullptr;
+        if (posix_memalign(&p, 4096, (size_t) (n_slots_ * bundle_bytes_)) != 0 || !p) {
+            throw std::runtime_error("moe: cannot allocate the host expert cache arena");
+        }
+        arena_ = (uint8_t *) p;
+        slabs_.resize((size_t) n_slots_);
+    }
     name_ = std::string("hostcache(") + inner_->name() + ")";
 }
 
-const CachingExpertStore::Entry * CachingExpertStore::find_locked(ExpertKey k) const {
-    auto it = map_.find({ k.layer, k.expert });
-    return it == map_.end() ? nullptr : &it->second;
+CachingExpertStore::~CachingExpertStore() {
+    if (arena_) {
+        free(arena_);
+    }
 }
 
-void CachingExpertStore::insert_locked(ExpertKey k, std::vector<uint8_t> && bytes) {
-    const uint64_t sz = bytes.size();
-    if (sz > capacity_) {
-        return;   // cannot hold even one bundle: behave as a pass-through
+void CachingExpertStore::lru_unlink_locked(int i) {
+    Slab & s = slabs_[i];
+    if (s.prev >= 0) { slabs_[s.prev].next = s.next; } else if (head_ == i) { head_ = s.next; }
+    if (s.next >= 0) { slabs_[s.next].prev = s.prev; } else if (tail_ == i) { tail_ = s.prev; }
+    s.prev = s.next = -1;
+}
+
+void CachingExpertStore::lru_touch_locked(int i) {
+    lru_unlink_locked(i);
+    Slab & s = slabs_[i];
+    s.next = head_;
+    if (head_ >= 0) { slabs_[head_].prev = i; }
+    head_ = i;
+    if (tail_ < 0) { tail_ = i; }
+}
+
+int CachingExpertStore::lru_victim_locked() const {
+    for (int i = tail_; i >= 0; i = slabs_[i].prev) {
+        if (slabs_[i].state == St::READY && slabs_[i].readers == 0) {
+            return i;
+        }
     }
-    while (used_ + sz > capacity_ && !map_.empty()) {
-        // evict least recently used (linear scan; the map holds at most a few thousand bundles)
-        auto victim = map_.begin();
-        for (auto it = map_.begin(); it != map_.end(); ++it) {
-            if (it->second.last_use < victim->second.last_use) {
-                victim = it;
+    return -1;
+}
+
+int CachingExpertStore::acquire_locked(std::unique_lock<std::mutex> & lock, ExpertKey key, int & reserved) {
+    reserved = -1;
+    for (;;) {
+        auto it = index_.find({ key.layer, key.expert });
+        if (it != index_.end()) {
+            Slab & s = slabs_[it->second];
+            if (s.state == St::READY) {
+                return it->second;
+            }
+            cv_.wait(lock);   // another thread is loading it
+            continue;
+        }
+        // miss: reserve a slab (a FREE one first, else the LRU READY one not being read)
+        int v = -1;
+        if (n_ready_ + 0 < n_slots_) {
+            for (size_t i = 0; i < slabs_.size(); ++i) {
+                if (slabs_[i].state == St::FREE) { v = (int) i; break; }
             }
         }
-        used_ -= victim->second.bytes.size();
-        map_.erase(victim);
-        stats_.evictions++;
+        if (v < 0) {
+            v = lru_victim_locked();
+        }
+        if (v < 0) {
+            cv_.wait(lock);   // everything is LOADING or being read; wait for something to settle
+            continue;
+        }
+        Slab & s = slabs_[v];
+        if (s.state == St::READY) {
+            index_.erase({ s.layer, s.expert });
+            n_ready_--;
+            stats_.evictions++;
+        }
+        lru_unlink_locked(v);
+        s.state = St::LOADING;
+        s.layer = key.layer;
+        s.expert = key.expert;
+        index_[{ key.layer, key.expert }] = v;
+        reserved = v;
+        return -1;
     }
-    Entry & e = map_[{ k.layer, k.expert }];
-    used_ -= e.bytes.size();
-    e.bytes = std::move(bytes);
-    e.last_use = ++clock_;
-    used_ += sz;
-    stats_.bytes_inserted += sz;
+}
+
+void CachingExpertStore::read_bundle(const ExpertDescriptor & e, const std::vector<void *> & dsts) {
+    if (n_slots_ == 0 || e.total_bytes != bundle_bytes_) {
+        // pass-through (cache disabled or a descriptor of a different size)
+        for (size_t i = 0; i < e.slices.size(); ++i) {
+            inner_->read_slice(e, i, dsts[i]);
+        }
+        return;
+    }
+    std::unique_lock<std::mutex> lock(mtx_);
+    int reserved = -1;
+    int i = acquire_locked(lock, e.key, reserved);
+    if (i < 0) {
+        // miss: read from storage straight into the reserved slab, outside the lock
+        stats_.misses++;
+        lock.unlock();
+        uint8_t * slab = arena_ + (size_t) reserved * bundle_bytes_;
+        try {
+            uint64_t off = 0;
+            for (size_t k = 0; k < e.slices.size(); ++k) {
+                inner_->read_slice(e, k, slab + off);
+                off += e.slices[k].bytes;
+            }
+        } catch (...) {
+            lock.lock();
+            index_.erase({ e.key.layer, e.key.expert });
+            slabs_[reserved].state = St::FREE;
+            cv_.notify_all();
+            throw;
+        }
+        lock.lock();
+        slabs_[reserved].state = St::READY;
+        n_ready_++;
+        stats_.bytes_inserted += bundle_bytes_;
+        i = reserved;
+        cv_.notify_all();
+    } else {
+        stats_.hits++;
+        stats_.bytes_from_cache += bundle_bytes_;
+    }
+    lru_touch_locked(i);
+    slabs_[i].readers++;
+    lock.unlock();
+    // copy out without holding the lock; the slab cannot be evicted while readers > 0
+    const uint8_t * slab = arena_ + (size_t) i * bundle_bytes_;
+    uint64_t off = 0;
+    for (size_t k = 0; k < e.slices.size(); ++k) {
+        memcpy(dsts[k], slab + off, e.slices[k].bytes);
+        off += e.slices[k].bytes;
+    }
+    lock.lock();
+    slabs_[i].readers--;
+    cv_.notify_all();
 }
 
 void CachingExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
-    const TensorSlice & s = e.slices.at(slice);
-    uint64_t off = 0;
-    for (size_t i = 0; i < slice; ++i) {
-        off += e.slices[i].bytes;
-    }
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        if (const Entry * en = find_locked(e.key)) {
-            memcpy(dst, en->bytes.data() + off, s.bytes);
-            const_cast<Entry *>(en)->last_use = ++clock_;
-            stats_.hits++;
-            stats_.bytes_from_cache += s.bytes;
-            return;
+    // single-slice reads (verify wrapper) go through the bundle path with scratch for the other slices
+    std::vector<std::vector<uint8_t>> scratch(e.slices.size());
+    std::vector<void *> dsts(e.slices.size());
+    for (size_t k = 0; k < e.slices.size(); ++k) {
+        if (k == slice) {
+            dsts[k] = dst;
+        } else {
+            scratch[k].resize(e.slices[k].bytes);
+            dsts[k] = scratch[k].data();
         }
-        stats_.misses++;
     }
-    // miss: fetch the whole bundle from the inner store (one read per slice), serve, and write through
-    std::vector<uint8_t> bundle(e.total_bytes);
-    uint64_t o = 0;
-    for (size_t i = 0; i < e.slices.size(); ++i) {
-        inner_->read_slice(e, i, bundle.data() + o);
-        o += e.slices[i].bytes;
-    }
-    memcpy(dst, bundle.data() + off, s.bytes);
-    std::lock_guard<std::mutex> lock(mtx_);
-    insert_locked(e.key, std::move(bundle));
+    read_bundle(e, dsts);
 }
 
 CachingExpertStore::Stats CachingExpertStore::stats() const {
@@ -343,7 +435,7 @@ CachingExpertStore::Stats CachingExpertStore::stats() const {
 
 uint64_t CachingExpertStore::resident_bytes() const {
     std::lock_guard<std::mutex> lock(mtx_);
-    return used_;
+    return n_ready_ * bundle_bytes_;
 }
 
 VerifyingExpertStore::VerifyingExpertStore(std::unique_ptr<ExpertStore> primary, std::unique_ptr<ExpertStore> reference)
@@ -503,6 +595,8 @@ static void read_expert(ExpertStore & store, const ExpertDescriptor & d, std::ve
     }
     if (auto * pack = dynamic_cast<PackExpertStore *>(&store)) {
         pack->read_bundle(d, dsts);
+    } else if (auto * cache = dynamic_cast<CachingExpertStore *>(&store)) {
+        cache->read_bundle(d, dsts);
     } else {
         for (size_t i = 0; i < d.slices.size(); ++i) {
             store.read_slice(d, i, dsts[i]);

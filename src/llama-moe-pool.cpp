@@ -271,7 +271,7 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         default: throw std::runtime_error("moe pool: unknown store mode " + std::to_string(store_mode));
     }
     if (host_cache_bytes > 0 && store_mode >= 1) {
-        auto cache = std::make_unique<moe::CachingExpertStore>(std::move(store_), host_cache_bytes);
+        auto cache = std::make_unique<moe::CachingExpertStore>(std::move(store_), host_cache_bytes, index_.descs[0].total_bytes);
         host_cache_ = cache.get();
         store_ = std::move(cache);
     }

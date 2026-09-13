@@ -158,37 +158,49 @@ private:
     bool direct_ = true;
 };
 
-// Host tier (moe-stream-lab ADR 0008): a bounded LRU of whole expert bundles in RAM in front of any store.
-// Reads are served from RAM when present; otherwise they go to the inner store and are written through.
-// Keyed by ExpertKey; capacity in bytes; thread-safe.
+// Host tier (moe-stream-lab ADR 0008): a bounded cache of whole expert bundles in RAM in front of any store.
+// Bundles live in a pre-allocated slab arena (no per-miss allocation); O(1) LRU; misses are read from the
+// inner store straight into the arena slot while other threads may wait on that slot. Thread-safe.
 class CachingExpertStore : public ExpertStore {
 public:
-    CachingExpertStore(std::unique_ptr<ExpertStore> inner, uint64_t capacity_bytes);
+    CachingExpertStore(std::unique_ptr<ExpertStore> inner, uint64_t capacity_bytes, uint64_t bundle_bytes);
+    ~CachingExpertStore() override;
 
     void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
+    // fetch all slices of `e` into dsts (one per slice); counts one hit or miss per bundle
+    void read_bundle(const ExpertDescriptor & e, const std::vector<void *> & dsts);
     const char * name() const override { return name_.c_str(); }
 
     struct Stats { uint64_t hits = 0, misses = 0, bytes_from_cache = 0, bytes_inserted = 0, evictions = 0; };
     Stats    stats() const;
     uint64_t resident_bytes() const;
-    uint64_t capacity() const { return capacity_; }
+    uint64_t capacity() const { return n_slots_ * bundle_bytes_; }
     ExpertStore & inner() { return *inner_; }
 
 private:
-    struct Entry {
-        std::vector<uint8_t> bytes;   // whole bundle, slices in descriptor order
-        uint64_t last_use = 0;
+    enum class St : uint8_t { FREE, LOADING, READY };
+    struct Slab {
+        St       state = St::FREE;
+        uint32_t layer = 0, expert = 0;
+        int      prev = -1, next = -1;   // LRU list, head = most recent
+        uint32_t readers = 0;             // threads copying out of this slab (cannot be evicted)
     };
-    // look up / fill a whole bundle; returns a pointer valid while `mtx_` is held by the caller
-    const Entry * find_locked(ExpertKey k) const;
-    void insert_locked(ExpertKey k, std::vector<uint8_t> && bytes);
+    // returns slab index holding `key` READY (waits for LOADING), or -1 with a reserved LOADING slab in `reserved`
+    int acquire_locked(std::unique_lock<std::mutex> & lock, ExpertKey key, int & reserved);
+    void lru_touch_locked(int i);
+    void lru_unlink_locked(int i);
+    int  lru_victim_locked() const;
 
     std::unique_ptr<ExpertStore> inner_;
-    uint64_t capacity_;
-    uint64_t used_ = 0;
-    uint64_t clock_ = 0;
-    std::map<std::pair<uint32_t, uint32_t>, Entry> map_;
+    uint64_t bundle_bytes_;
+    uint64_t n_slots_;
+    uint8_t * arena_ = nullptr;
+    std::vector<Slab> slabs_;
+    std::map<std::pair<uint32_t, uint32_t>, int> index_;
+    int head_ = -1, tail_ = -1;
+    uint64_t n_ready_ = 0;
     mutable std::mutex mtx_;
+    std::condition_variable cv_;
     Stats stats_;
     std::string name_;
 };
