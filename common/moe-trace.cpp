@@ -25,6 +25,7 @@ struct moe_tracer {
     std::mutex mtx;
     // dump of MoE layer outputs
     std::string dump_dir;
+    std::string dump_prefix = "ffn_moe_out-";
     int         dump_n    = 0;
     int64_t     dump_ub   = -1;   // index of the ubatch currently being dumped
     int         dump_last_il = -1;
@@ -92,6 +93,12 @@ void common_moe_trace_set_dump(const std::string & dir, int n_ubatches) {
     t.dump_n   = n_ubatches;
 }
 
+void common_moe_trace_set_dump_prefix(const std::string & prefix) {
+    auto & t = tracer();
+    std::lock_guard<std::mutex> lock(t.mtx);
+    t.dump_prefix = prefix + "-";
+}
+
 void common_moe_trace_close() {
     auto & t = tracer();
     std::lock_guard<std::mutex> lock(t.mtx);
@@ -107,7 +114,7 @@ bool common_moe_trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data
     const int il_topk  = parse_layer(t->name, TOPK_PREFIX,  strlen(TOPK_PREFIX));
     const int il_probs = il_topk >= 0 ? -1 : parse_layer(t->name, PROBS_PREFIX, strlen(PROBS_PREFIX));
 
-    const int il_out = (il_topk >= 0 || il_probs >= 0) ? -1 : parse_layer(t->name, OUT_PREFIX, strlen(OUT_PREFIX));
+    const int il_out = (il_topk >= 0 || il_probs >= 0) ? -1 : parse_layer(t->name, tr->dump_prefix.c_str(), tr->dump_prefix.size());
 
     if (ask) {
         // only request data for the tensors we care about; everything else runs fused/async as usual
@@ -141,6 +148,7 @@ bool common_moe_trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data
                 tr->fbuf.resize(n);
                 ggml_backend_tensor_get(t, tr->fbuf.data(), 0, n * sizeof(float));
                 const std::string path = tr->dump_dir + "/ub" + std::to_string(tr->dump_ub) + "_layer" + std::to_string(il_out) + ".f32";
+                // note: dumped tensors may be non-F32 or non-contiguous for arbitrary prefixes; we only handle F32 here
                 FILE * f = fopen(path.c_str(), "wb");
                 if (f) {
                     const uint32_t hdr[2] = { (uint32_t) t->ne[0], (uint32_t) t->ne[1] };

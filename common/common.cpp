@@ -1765,6 +1765,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         void * ud = common_moe_trace_install(params.moe_trace_file.empty() ? "/dev/null" : params.moe_trace_file);
         if (ud && !params.moe_dump_dir.empty()) {
             common_moe_trace_set_dump(params.moe_dump_dir, params.moe_dump_ubatches);
+            if (!params.moe_dump_prefix.empty()) {
+                common_moe_trace_set_dump_prefix(params.moe_dump_prefix);
+            }
         }
         if (ud) {
             cparams.cb_eval           = common_moe_trace_cb_eval;
