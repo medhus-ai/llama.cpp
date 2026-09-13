@@ -61,11 +61,20 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
     }
 
     // --- pool tensors: one per (layer, kind), ne[2] = n_slots, same buffer type as the source ---
-    ggml_init_params ip = { ggml_tensor_overhead() * n_tensors, nullptr, true };
-    ctx_ = ggml_init(ip);
-    if (!ctx_) {
-        throw std::runtime_error("moe pool: ggml_init failed");
-    }
+    // a ggml context per buffer type; tensors are created in the context of the layer's device buft
+    auto ctx_for = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_by_buft_.find(buft);
+        if (it != ctx_by_buft_.end()) {
+            return it->second;
+        }
+        ggml_init_params ip = { ggml_tensor_overhead() * n_tensors, nullptr, true };
+        ggml_context * c = ggml_init(ip);
+        if (!c) {
+            throw std::runtime_error("moe pool: ggml_init failed");
+        }
+        ctx_by_buft_[buft] = c;
+        return c;
+    };
 
     // When reading from the file, resolve every expert tensor's absolute offset from the GGUF metadata.
     // The index stays model-independent: it only records byte ranges.
@@ -137,17 +146,22 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
             if (!ggml_is_contiguous(src)) {
                 throw std::runtime_error(std::string("moe pool: expert tensor not contiguous: ") + ggml_get_name(src));
             }
-            ggml_backend_buffer_type_t src_buft = ggml_backend_buffer_get_type(src->buffer);
-            const char * src_buft_name = ggml_backend_buft_name(src_buft);
+            const char * src_buft_name = ggml_backend_buft_name(ggml_backend_buffer_get_type(src->buffer));
             if (strstr(src_buft_name, "REPACK") != nullptr) {
                 throw std::runtime_error(std::string("moe pool: expert tensors are in the ") + src_buft_name +
                                          " buffer type, whose contents cannot be read back; rerun with --no-repack");
             }
-            if (!buft) {
-                buft = src_buft;
-            } else if (buft != src_buft) {
-                throw std::runtime_error("moe pool: expert tensors live in different buffer types; not supported yet");
+            // the pool lives where the layer computes (VRAM for offloaded layers), regardless of where the
+            // source tensor sits (lazily-read sources are always host-mapped)
+            ggml_backend_buffer_type_t layer_buft = model.select_buft((int) il);
+            if (strstr(ggml_backend_buft_name(layer_buft), "REPACK") != nullptr) {
+                throw std::runtime_error("moe pool: layer buffer type is a REPACK type; rerun with --no-repack");
             }
+            if (shared_ && buft && buft != layer_buft) {
+                throw std::runtime_error("moe pool: --moe-pool-shared needs every MoE layer on the same device");
+            }
+            buft = layer_buft;
+            ggml_context * ctx_ = ctx_for(layer_buft);
             ggml_tensor * pt = nullptr;
             if (shared_) {
                 auto it = shared_tensors_.find(k.name);
@@ -204,11 +218,20 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         }
     }
 
-    buf_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_, buft);
-    if (!buf_) {
-        throw std::runtime_error("moe pool: failed to allocate pool buffer");
+    size_t pool_bytes = 0;
+    bool   all_host   = true;
+    std::string buft_names;
+    for (auto & [bt, c] : ctx_by_buft_) {
+        ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(c, bt);
+        if (!b) {
+            throw std::runtime_error(std::string("moe pool: failed to allocate pool buffer in ") + ggml_backend_buft_name(bt));
+        }
+        ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        bufs_.push_back(b);
+        pool_bytes += ggml_backend_buffer_get_size(b);
+        all_host = all_host && ggml_backend_buffer_is_host(b);
+        buft_names += (buft_names.empty() ? "" : "+") + std::string(ggml_backend_buft_name(bt));
     }
-    ggml_backend_buffer_set_usage(buf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     if (meta) {
         gguf_free(meta);
@@ -258,9 +281,9 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
     // safe for host buffers (a memcpy each) but not for device buffers, where the transfer goes through a
     // stream. Refuse rather than corrupt; the device path gets its own transfer scheduler in M6/M8.
     int32_t n_io = io_threads > 0 ? io_threads : 1;
-    if (n_io > 1 && !ggml_backend_buffer_is_host(buf_)) {
+    if (n_io > 1 && !all_host) {
         fprintf(stderr, "moe pool: --moe-io-threads > 1 is only supported for host pool buffers "
-                        "(this pool is in %s), falling back to sequential fetch\n", ggml_backend_buft_name(buft));
+                        "(this pool is in %s), falling back to sequential fetch\n", buft_names.c_str());
         n_io = 1;
     }
     for (auto & pool : pools_) {
@@ -272,18 +295,19 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
                     "pool buffer %.2f MiB (%s), store = %s, io threads = %d\n",
                     shared_ ? "shared" : "per-layer", index_.moe_layers.size(), n_slots,
                     shared_ ? " total" : " per layer", d0.slices.size(), d0.total_bytes / (1024.0 * 1024.0),
-                    ggml_backend_buffer_get_size(buf_) / (1024.0 * 1024.0), ggml_backend_buft_name(buft), store_->name(), n_io);
+                    pool_bytes / (1024.0 * 1024.0), buft_names.c_str(), store_->name(), n_io);
 
     model.hparams.moe_pool_active = true;
 }
 
 llama_moe_pool::~llama_moe_pool() {
     fprintf(stderr, "moe pool stats: %s\n", stats_json().c_str());
-    if (buf_) {
-        ggml_backend_buffer_free(buf_);
+    for (auto * b : bufs_) {
+        ggml_backend_buffer_free(b);
     }
-    if (ctx_) {
-        ggml_free(ctx_);
+    for (auto & [bt, c] : ctx_by_buft_) {
+        (void) bt;
+        ggml_free(c);
     }
 }
 
