@@ -70,7 +70,6 @@ struct llama_hparams {
     // per-token adapter selection. -1 when the model has no such layer.
     int32_t  router_layer = -1;
     uint32_t n_expert = 0;
-    bool     moe_pool_active = false; // moe-stream-lab: routed experts are served from a compact slot pool
     uint32_t n_rel_attn_bkts = 0;
 
     // TODO: this needs to be reworked
@@ -502,6 +501,11 @@ struct llama_hparams {
 
 
     bool use_mrope() const;
+
+    // moe-stream-lab: routed experts are served from a compact slot pool.
+    // Kept at the end of the struct on purpose: inserting it between existing members shifts every
+    // following field, including the per-layer arrays read in hot paths.
+    bool     moe_pool_active = false;
 };
 
 static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams must be trivially copyable");

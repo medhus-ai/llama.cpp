@@ -20,7 +20,7 @@ struct ggml_context;
 
 struct llama_moe_pool {
     // store_mode: 0 = resident tensors (memory), 1 = positional reads from the model file
-    llama_moe_pool(llama_model & model, int32_t n_slots, int32_t store_mode, const std::string & model_path, bool verify, bool shared);
+    llama_moe_pool(llama_model & model, int32_t n_slots, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads);
     ~llama_moe_pool();
 
     llama_moe_pool(const llama_moe_pool &) = delete;

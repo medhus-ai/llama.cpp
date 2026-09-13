@@ -14,7 +14,7 @@
 
 static const char * SLOT_IDS_PREFIX = "ffn_moe_slot_ids-";
 
-llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t store_mode, const std::string & model_path, bool verify, bool shared)
+llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads)
     : n_slots(n_slots_) {
     if (n_slots <= 0) {
         throw std::runtime_error("moe pool: n_slots must be > 0");
@@ -226,12 +226,25 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         store_ = std::make_unique<moe::VerifyingExpertStore>(std::move(store_), std::make_unique<moe::MemoryExpertStore>());
     }
 
+    // Parallel fetch writes into disjoint byte ranges of the pool tensors from several threads, which is
+    // safe for host buffers (a memcpy each) but not for device buffers, where the transfer goes through a
+    // stream. Refuse rather than corrupt; the device path gets its own transfer scheduler in M6/M8.
+    int32_t n_io = io_threads > 0 ? io_threads : 1;
+    if (n_io > 1 && !ggml_backend_buffer_is_host(buf_)) {
+        fprintf(stderr, "moe pool: --moe-io-threads > 1 is only supported for host pool buffers "
+                        "(this pool is in %s), falling back to sequential fetch\n", ggml_backend_buft_name(buft));
+        n_io = 1;
+    }
+    for (auto & pool : pools_) {
+        pool->set_io_threads((uint32_t) n_io);
+    }
+
     const auto & d0 = index_.descs[0];
     fprintf(stderr, "moe pool: %s pool, %zu MoE layers, %d slots%s, %zu tensors/expert, %.2f MiB/expert, "
-                    "pool buffer %.2f MiB (%s), store = %s\n",
+                    "pool buffer %.2f MiB (%s), store = %s, io threads = %d\n",
                     shared_ ? "shared" : "per-layer", index_.moe_layers.size(), n_slots,
                     shared_ ? " total" : " per layer", d0.slices.size(), d0.total_bytes / (1024.0 * 1024.0),
-                    ggml_backend_buffer_get_size(buf_) / (1024.0 * 1024.0), ggml_backend_buft_name(buft), store_->name());
+                    ggml_backend_buffer_get_size(buf_) / (1024.0 * 1024.0), ggml_backend_buft_name(buft), store_->name(), n_io);
 
     model.hparams.moe_pool_active = true;
 }

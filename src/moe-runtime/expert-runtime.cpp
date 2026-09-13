@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -84,9 +85,9 @@ void BufferedFileExpertStore::read_slice(const ExpertDescriptor & e, size_t slic
         out += n;
         off += (uint64_t) n;
         rem -= (uint64_t) n;
-        reads_++;
+        reads_.fetch_add(1, std::memory_order_relaxed);
     }
-    bytes_ += s.bytes;
+    bytes_.fetch_add(s.bytes, std::memory_order_relaxed);
 #else
     (void) e; (void) slice; (void) dst;
     throw std::runtime_error("moe: BufferedFileExpertStore is implemented for POSIX only");
@@ -146,33 +147,46 @@ DirectIOExpertStore::DirectIOExpertStore(const std::string & path) : path_(path)
 
 DirectIOExpertStore::~DirectIOExpertStore() {
 #ifndef _WIN32
-    if (buf_) {
-        free(buf_);
-    }
     if (fd_ >= 0) {
         close(fd_);
     }
 #endif
 }
 
-void DirectIOExpertStore::ensure_buffer(size_t bytes) {
+DirectIOExpertStore::staging::~staging() {
 #ifndef _WIN32
-    if (buf_cap_ >= bytes) {
-        return;
+    if (buf) {
+        free(buf);
     }
-    if (buf_) {
-        free(buf_);
-        buf_ = nullptr;
+#endif
+}
+
+uint8_t * DirectIOExpertStore::staging::get(size_t bytes, size_t align) {
+#ifndef _WIN32
+    if (cap >= bytes) {
+        return buf;
+    }
+    if (buf) {
+        free(buf);
+        buf = nullptr;
+        cap = 0;
     }
     void * p = nullptr;
-    if (posix_memalign(&p, align_, bytes) != 0 || !p) {
+    if (posix_memalign(&p, align, bytes) != 0 || !p) {
         throw std::runtime_error("moe: cannot allocate an aligned staging buffer of " + std::to_string(bytes) + " bytes");
     }
-    buf_ = (uint8_t *) p;
-    buf_cap_ = bytes;
+    buf = (uint8_t *) p;
+    cap = bytes;
+    return buf;
 #else
-    (void) bytes;
+    (void) bytes; (void) align;
+    return nullptr;
 #endif
+}
+
+DirectIOExpertStore::staging & DirectIOExpertStore::tls_staging() {
+    thread_local staging st;
+    return st;
 }
 
 void DirectIOExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
@@ -184,11 +198,12 @@ void DirectIOExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, v
     const uint64_t begin   = (s.file_offset / align_) * align_;
     const uint64_t end     = ((s.file_offset + s.bytes + align_ - 1) / align_) * align_;
     const size_t   span    = (size_t) (end - begin);
-    ensure_buffer(span);
+    uint8_t * buf = tls_staging().get(span, align_);
 
     size_t   got = 0;
+    uint64_t n_reads = 0;
     while (got < span) {
-        const ssize_t n = pread(fd_, buf_ + got, span - got, (off_t) (begin + got));
+        const ssize_t n = pread(fd_, buf + got, span - got, (off_t) (begin + got));
         if (n < 0) {
             throw std::runtime_error("moe: read error for " + s.name + " at offset " + std::to_string(begin + got));
         }
@@ -200,14 +215,15 @@ void DirectIOExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, v
             break;
         }
         got += (size_t) n;
-        reads_++;
+        n_reads++;
     }
     if (begin + got < s.file_offset + s.bytes) {
         throw std::runtime_error("moe: short read for " + s.name);
     }
-    memcpy(dst, buf_ + (s.file_offset - begin), s.bytes);
-    bytes_read_ += got;
-    bytes_used_ += s.bytes;
+    memcpy(dst, buf + (s.file_offset - begin), s.bytes);
+    reads_.fetch_add(n_reads, std::memory_order_relaxed);
+    bytes_read_.fetch_add(got, std::memory_order_relaxed);
+    bytes_used_.fetch_add(s.bytes, std::memory_order_relaxed);
 #else
     (void) e; (void) slice; (void) dst;
     throw std::runtime_error("moe: DirectIOExpertStore is implemented for POSIX only");
@@ -223,11 +239,11 @@ void VerifyingExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, 
     primary_->read_slice(e, slice, dst);
 
     const TensorSlice & s = e.slices.at(slice);
-    ref_buf_.resize(s.bytes);
-    reference_->read_slice(e, slice, ref_buf_.data());
+    std::vector<uint8_t> ref_buf(s.bytes);   // per call: this may run on several fetch workers at once
+    reference_->read_slice(e, slice, ref_buf.data());
 
     const uint8_t * a = (const uint8_t *) dst;
-    const uint8_t * b = ref_buf_.data();
+    const uint8_t * b = ref_buf.data();
     for (uint64_t i = 0; i < s.bytes; ++i) {
         if (a[i] != b[i]) {
             throw std::runtime_error("moe: VERIFY FAILED for layer " + std::to_string(e.key.layer) +
@@ -294,9 +310,6 @@ void LayerPool::load(const ExpertIndex & idx, ExpertStore & store, ExpertKey k, 
         throw std::runtime_error("moe: descriptor slice count != pool tensor count");
     }
     Slot & s = slots_[slot];
-    if (s.state == SlotState::READY) {
-        stats.evictions++;
-    }
     s.state = SlotState::LOADING;
     s.key = k;
     s.generation++;
@@ -314,6 +327,83 @@ void LayerPool::load(const ExpertIndex & idx, ExpertStore & store, ExpertKey k, 
         stats.bytes_read += sl.bytes;
     }
     s.state = SlotState::READY;
+}
+
+void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
+                          const std::vector<std::pair<ExpertKey, int>> & work, PoolStats & stats) {
+    if (work.empty()) {
+        return;
+    }
+    const uint32_t n_threads = std::min<uint32_t>(io_threads_, (uint32_t) work.size());
+
+    if (n_threads <= 1) {
+        for (const auto & w : work) {
+            load(idx, store, w.first, w.second, stats);
+        }
+        return;
+    }
+
+    // Workers only move bytes; slot bookkeeping stays on this thread (before and after), so there is no
+    // shared mutable state except the per-worker staging buffers inside the store.
+    for (const auto & w : work) {
+        Slot & sl = slots_[w.second];
+        sl.state = SlotState::LOADING;
+        sl.key   = w.first;
+        sl.generation++;
+    }
+
+    std::atomic<size_t> next{0};
+    std::atomic<uint64_t> bytes{0};
+    std::vector<std::exception_ptr> errors(n_threads);
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads);
+
+    for (uint32_t t = 0; t < n_threads; ++t) {
+        workers.emplace_back([&, t]() {
+            std::vector<uint8_t> buf;
+            try {
+                for (;;) {
+                    const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= work.size()) {
+                        break;
+                    }
+                    const ExpertDescriptor & d = idx.get(work[i].first);
+                    const int slot = work[i].second;
+                    if (d.slices.size() != tensors_.size()) {
+                        throw std::runtime_error("moe: descriptor slice count != pool tensor count");
+                    }
+                    for (size_t k = 0; k < d.slices.size(); ++k) {
+                        const TensorSlice & sl = d.slices[k];
+                        ggml_tensor * pt = tensors_[k];
+                        const uint64_t slot_bytes = pt->nb[2];
+                        if (sl.bytes != slot_bytes) {
+                            throw std::runtime_error("moe: slice bytes != pool slot bytes for " + sl.name);
+                        }
+                        buf.resize(sl.bytes);
+                        store.read_slice(d, k, buf.data());
+                        // disjoint byte ranges of the same tensor, one slot per worker at a time
+                        ggml_backend_tensor_set(pt, buf.data(), (size_t) slot * slot_bytes, sl.bytes);
+                        bytes.fetch_add(sl.bytes, std::memory_order_relaxed);
+                    }
+                }
+            } catch (...) {
+                errors[t] = std::current_exception();
+            }
+        });
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+    for (auto & e : errors) {
+        if (e) {
+            std::rethrow_exception(e);   // no partial state is published: slots stay LOADING
+        }
+    }
+
+    for (const auto & w : work) {
+        slots_[w.second].state = SlotState::READY;
+    }
+    stats.bytes_read += bytes.load();
 }
 
 void LayerPool::ensure(const ExpertIndex & idx, ExpertStore & store, const std::vector<ExpertKey> & keys,
@@ -349,8 +439,8 @@ void LayerPool::ensure(const ExpertIndex & idx, ExpertStore & store, const std::
             slots_[s].last_use = ++clock;
         }
     }
-    // pass 2: load misses
-    size_t n_miss = 0;
+    // pass 2: choose a slot for every miss first, then fetch them together
+    std::vector<std::pair<ExpertKey, int>> work;
     for (const auto & k : distinct) {
         if (find(k) >= 0) {
             continue;
@@ -359,10 +449,19 @@ void LayerPool::ensure(const ExpertIndex & idx, ExpertStore & store, const std::
         if (v < 0) {
             throw std::runtime_error("moe: no evictable slot (all IN_USE/LOADING)");
         }
-        load(idx, store, k, v, stats);
-        slots_[v].state = SlotState::IN_USE;
-        slots_[v].last_use = ++clock;
-        n_miss++;
+        // reserve the slot immediately so the next iteration cannot pick it again; this is the eviction
+        if (slots_[v].state == SlotState::READY) {
+            stats.evictions++;
+        }
+        slots_[v].state = SlotState::LOADING;
+        slots_[v].key   = k;
+        work.emplace_back(k, v);
+    }
+    const size_t n_miss = work.size();
+    load_many(idx, store, work, stats);
+    for (const auto & w : work) {
+        slots_[w.second].state = SlotState::IN_USE;
+        slots_[w.second].last_use = ++clock;
     }
     // resolve ids and release
     for (size_t i = 0; i < keys.size(); ++i) {
