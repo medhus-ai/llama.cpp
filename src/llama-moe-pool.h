@@ -47,8 +47,9 @@ private:
     moe::PoolStats                               stats_;
     uint64_t                                     clock_ = 0;
 
-    ggml_context *        ctx_ = nullptr;
-    ggml_backend_buffer_t buf_ = nullptr;
+    // one ggml context + buffer per buffer type (layers may live on different devices)
+    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_by_buft_;
+    std::vector<ggml_backend_buffer_t> bufs_;
 
     std::vector<int32_t>        ids_buf_;
     std::vector<moe::ExpertKey> keys_buf_;
