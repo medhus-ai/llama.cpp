@@ -333,6 +333,9 @@ extern "C" {
         const char * moe_pack_path; // moe-stream-lab: moepack sidecar for moe_store == 3 (NULL = <model>.moepack)
         uint64_t moe_host_cache_bytes; // moe-stream-lab: RAM cache of expert bundles in front of storage (0 = off)
         bool     moe_sync_io;          // moe-stream-lab: force synchronous H2D copies (A/B against the async transfer stream)
+        int32_t  moe_prefetch_k;       // moe-stream-lab: prerouter top-k candidates per token (0 = off)
+        int32_t  moe_prefetch_lookahead; // moe-stream-lab: how many MoE layers ahead the prerouter predicts
+        const char * moe_prefetch_src; // moe-stream-lab: residual-stream tensor name prefix (NULL = nemotron_h_block_out)
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

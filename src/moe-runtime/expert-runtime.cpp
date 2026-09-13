@@ -363,6 +363,10 @@ int CachingExpertStore::acquire_locked(std::unique_lock<std::mutex> & lock, Expe
             index_.erase({ s.layer, s.expert });
             n_ready_--;
             stats_.evictions++;
+            if (s.prefetched) {
+                stats_.prefetch_wasted++;
+                s.prefetched = false;
+            }
         }
         lru_unlink_locked(v);
         s.state = St::LOADING;
@@ -374,7 +378,7 @@ int CachingExpertStore::acquire_locked(std::unique_lock<std::mutex> & lock, Expe
     }
 }
 
-int CachingExpertStore::resident_index(const ExpertDescriptor & e) {
+int CachingExpertStore::resident_index(const ExpertDescriptor & e, bool is_prefetch) {
     std::unique_lock<std::mutex> lock(mtx_);
     int reserved = -1;
     int i = acquire_locked(lock, e.key, reserved);
@@ -398,17 +402,49 @@ int CachingExpertStore::resident_index(const ExpertDescriptor & e) {
         }
         lock.lock();
         slabs_[reserved].state = St::READY;
+        slabs_[reserved].prefetched = is_prefetch;
         n_ready_++;
         stats_.bytes_inserted += bundle_bytes_;
+        if (is_prefetch) {
+            stats_.prefetched++;
+        }
         i = reserved;
         cv_.notify_all();
     } else {
-        stats_.hits++;
-        stats_.bytes_from_cache += bundle_bytes_;
+        if (is_prefetch) {
+            // already resident: nothing to do, and not a prediction that helped
+        } else {
+            stats_.hits++;
+            stats_.bytes_from_cache += bundle_bytes_;
+            if (slabs_[i].prefetched) {
+                slabs_[i].prefetched = false;
+                stats_.prefetch_useful++;
+            }
+        }
     }
     lru_touch_locked(i);
     slabs_[i].readers++;
     return i;
+}
+
+bool CachingExpertStore::contains(ExpertKey k) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto it = index_.find({ k.layer, k.expert });
+    return it != index_.end() && slabs_[it->second].state == St::READY;
+}
+
+bool CachingExpertStore::prefetch(const ExpertDescriptor & e) {
+    if (n_slots_ == 0 || e.total_bytes != bundle_bytes_) {
+        return false;
+    }
+    if (contains(e.key)) {
+        return false;
+    }
+    const int i = resident_index(e, /*is_prefetch=*/ true);
+    std::lock_guard<std::mutex> lock(mtx_);
+    slabs_[i].readers--;
+    cv_.notify_all();
+    return true;
 }
 
 const uint8_t * CachingExpertStore::acquire_bundle(const ExpertDescriptor & e) {
