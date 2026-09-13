@@ -309,6 +309,10 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
 
+# moe-stream-lab: expert-runtime unit tests (no model required)
+llama_build_and_test(test-moe-pool.cpp)
+target_include_directories(test-moe-pool PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
