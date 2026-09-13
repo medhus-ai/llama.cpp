@@ -1547,7 +1547,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         res->reset_samplers();
     }
 
-    if (!params.moe_trace_file.empty()) {
+    if (!params.moe_trace_file.empty() || !params.moe_dump_dir.empty()) {
         common_moe_trace_set_enabled(true);
     }
 
@@ -1759,8 +1759,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
-    if (!params.moe_trace_file.empty() && cparams.cb_eval == nullptr) {
-        void * ud = common_moe_trace_install(params.moe_trace_file);
+    if ((!params.moe_trace_file.empty() || !params.moe_dump_dir.empty()) && cparams.cb_eval == nullptr) {
+        void * ud = common_moe_trace_install(params.moe_trace_file.empty() ? "/dev/null" : params.moe_trace_file);
+        if (ud && !params.moe_dump_dir.empty()) {
+            common_moe_trace_set_dump(params.moe_dump_dir, params.moe_dump_ubatches);
+        }
         if (ud) {
             cparams.cb_eval           = common_moe_trace_cb_eval;
             cparams.cb_eval_user_data = ud;

@@ -4584,6 +4584,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_POOL_SLOTS"));
     add_opt(common_arg(
+        {"--moe-dump-dir"}, "DIR",
+        "moe-stream-lab: dump the MoE layer outputs (ffn_moe_out) of the first ubatches to DIR for operator-level comparison",
+        [](common_params & params, const std::string & value) {
+            params.moe_dump_dir = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_DUMP_DIR"));
+    add_opt(common_arg(
+        {"--moe-dump-ubatches"}, "N",
+        "moe-stream-lab: how many ubatches to dump with --moe-dump-dir (default 2)",
+        [](common_params & params, int value) {
+            params.moe_dump_ubatches = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-trace"}, "FNAME",
         "write a JSONL trace of routed-expert selections per token and layer (moe-stream-lab M1; default: disabled)",
         [](common_params & params, const std::string & value) {

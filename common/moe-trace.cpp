@@ -23,6 +23,12 @@ struct moe_tracer {
     int64_t last_n_tok   = 0;    // n_tokens of the previous ubatch
     std::vector<int32_t> buf;
     std::mutex mtx;
+    // dump of MoE layer outputs
+    std::string dump_dir;
+    int         dump_n    = 0;
+    int64_t     dump_ub   = -1;   // index of the ubatch currently being dumped
+    int         dump_last_il = -1;
+    std::vector<float> fbuf;
 };
 
 moe_tracer & tracer() {
@@ -49,6 +55,7 @@ int parse_layer(const char * name, const char * prefix, size_t prefix_len) {
 
 constexpr const char * TOPK_PREFIX  = "ffn_moe_topk-";
 constexpr const char * PROBS_PREFIX = "ffn_moe_probs-";
+constexpr const char * OUT_PREFIX   = "ffn_moe_out-";
 
 } // namespace
 
@@ -78,6 +85,13 @@ void common_moe_trace_set_enabled(bool enabled) {
     t.last_n_tok = 0;
 }
 
+void common_moe_trace_set_dump(const std::string & dir, int n_ubatches) {
+    auto & t = tracer();
+    std::lock_guard<std::mutex> lock(t.mtx);
+    t.dump_dir = dir;
+    t.dump_n   = n_ubatches;
+}
+
 void common_moe_trace_close() {
     auto & t = tracer();
     std::lock_guard<std::mutex> lock(t.mtx);
@@ -93,9 +107,11 @@ bool common_moe_trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data
     const int il_topk  = parse_layer(t->name, TOPK_PREFIX,  strlen(TOPK_PREFIX));
     const int il_probs = il_topk >= 0 ? -1 : parse_layer(t->name, PROBS_PREFIX, strlen(PROBS_PREFIX));
 
+    const int il_out = (il_topk >= 0 || il_probs >= 0) ? -1 : parse_layer(t->name, OUT_PREFIX, strlen(OUT_PREFIX));
+
     if (ask) {
         // only request data for the tensors we care about; everything else runs fused/async as usual
-        return il_topk >= 0 || (il_probs >= 0 && tr->n_expert < 0);
+        return il_topk >= 0 || (il_probs >= 0 && tr->n_expert < 0) || (il_out >= 0 && tr->dump_n > 0);
     }
 
     if (!tr->f) {
@@ -107,6 +123,32 @@ bool common_moe_trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data
     if (il_probs >= 0) {
         if (tr->n_expert < 0) {
             tr->n_expert = t->ne[0];
+        }
+        return true;
+    }
+
+    if (il_out >= 0) {
+        if (tr->dump_n > 0 && tr->enabled) {
+            if (il_out <= tr->dump_last_il) {
+                tr->dump_ub++;
+            } else if (tr->dump_ub < 0) {
+                tr->dump_ub = 0;
+            }
+            tr->dump_last_il = il_out;
+            if (tr->dump_ub < tr->dump_n) {
+                GGML_ASSERT(t->type == GGML_TYPE_F32);
+                const size_t n = ggml_nelements(t);
+                tr->fbuf.resize(n);
+                ggml_backend_tensor_get(t, tr->fbuf.data(), 0, n * sizeof(float));
+                const std::string path = tr->dump_dir + "/ub" + std::to_string(tr->dump_ub) + "_layer" + std::to_string(il_out) + ".f32";
+                FILE * f = fopen(path.c_str(), "wb");
+                if (f) {
+                    const uint32_t hdr[2] = { (uint32_t) t->ne[0], (uint32_t) t->ne[1] };
+                    fwrite(hdr, sizeof(hdr), 1, f);
+                    fwrite(tr->fbuf.data(), sizeof(float), n, f);
+                    fclose(f);
+                }
+            }
         }
         return true;
     }

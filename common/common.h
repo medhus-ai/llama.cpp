@@ -524,6 +524,8 @@ struct common_params {
     bool        moe_verify     = false;     // moe-stream-lab: byte-compare every expert read against resident tensors // NOLINT
     int32_t     moe_store      = 0;         // moe-stream-lab: 0 = resident tensors, 1 = read from the model file  // NOLINT
     int32_t     moe_pool_slots = 0;         // moe-stream-lab: compact expert pool slots per MoE layer (0 = off)  // NOLINT
+    std::string moe_dump_dir;               // moe-stream-lab: dump ffn_moe_out tensors of the first ubatches here     // NOLINT
+    int32_t     moe_dump_ubatches = 2;
     std::string moe_trace_file;             // moe-stream-lab: JSONL routing trace of selected experts       // NOLINT
     bool        save_logits       = false;  // whether to save logits to files                              // NOLINT
     std::vector<std::string> tensor_filter; // filter tensor names for debug output (regex)                 // NOLINT

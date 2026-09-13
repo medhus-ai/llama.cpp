@@ -25,5 +25,10 @@ bool common_moe_trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data
 
 void common_moe_trace_set_enabled(bool enabled);
 
+// Operator-level verification (moe-stream-lab spec §10): dump every "ffn_moe_out-<il>" tensor of the first
+// `n_ubatches` ubatches as raw F32 files "<dir>/ub<k>_layer<il>.f32" (header: two uint32 ne[0], ne[1]).
+// Same prompt in two modes -> compare with moe-stream-lab/scripts/compare_moe_out.py.
+void common_moe_trace_set_dump(const std::string & dir, int n_ubatches);
+
 // Flush and close (also called automatically at exit).
 void common_moe_trace_close();
