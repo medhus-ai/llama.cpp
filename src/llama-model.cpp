@@ -2800,6 +2800,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_io_threads              =*/ 1,
         /*.moe_pack_path               =*/ nullptr,
         /*.moe_host_cache_bytes        =*/ 0,
+        /*.moe_sync_io                 =*/ false,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

@@ -35,6 +35,11 @@ struct llama_moe_pool {
     void *                           user_ud = nullptr;
 
     int32_t n_slots = 0;
+    // called by llama_context once it knows its backends; enables async H2D for device pools
+    void attach_compute_backend(ggml_backend_t compute);
+    ggml_backend_t transfer_backend_ = nullptr;   // owned; a second backend instance = its own stream
+    ggml_backend_dev_t device_ = nullptr;
+    bool async_enabled_ = true;
     bool    shared_ = false;
 
 private:

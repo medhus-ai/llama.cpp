@@ -582,7 +582,7 @@ void FetchWorkers::loop() {
             const size_t i = next_++;
             lock.unlock();
             try {
-                (*fn_)(i);
+                fn_(i);
             } catch (...) {
                 lock.lock();
                 errors_.push_back(std::current_exception());
@@ -597,16 +597,63 @@ void FetchWorkers::loop() {
     }
 }
 
-void FetchWorkers::run(size_t n, const std::function<void(size_t)> & fn) {
-    std::unique_lock<std::mutex> lock(mtx_);
-    fn_ = &fn; n_ = n; next_ = 0; done_ = 0; errors_.clear(); gen_++;
+void FetchWorkers::start(size_t n, const std::function<void(size_t)> & fn) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    fn_ = fn; n_ = n; next_ = 0; done_ = 0; errors_.clear(); gen_++;
     cv_.notify_all();
+}
+
+void FetchWorkers::wait() {
+    std::unique_lock<std::mutex> lock(mtx_);
     done_cv_.wait(lock, [&] { return done_ == n_; });
     fn_ = nullptr;
     if (!errors_.empty()) {
         std::exception_ptr e = errors_.front();
         errors_.clear();
         std::rethrow_exception(e);
+    }
+}
+
+void FetchWorkers::run(size_t n, const std::function<void(size_t)> & fn) {
+    start(n, fn);
+    wait();
+}
+
+void LayerPool::set_device_backends(ggml_backend_t transfer, ggml_backend_t compute, ggml_backend_dev_t dev) {
+    drain_transfers();
+    if (event_) {
+        ggml_backend_event_free(event_);
+        event_ = nullptr;
+    }
+    transfer_ = transfer;
+    compute_  = compute;
+    if (transfer_ && compute_ && dev) {
+        event_ = ggml_backend_event_new(dev);
+        if (!event_) {
+            transfer_ = nullptr;   // backend has no events: stay synchronous
+        }
+    }
+}
+
+void LayerPool::drain_transfers() {
+    if (event_pending_ && event_) {
+        ggml_backend_event_synchronize(event_);
+        event_pending_ = false;
+    }
+    if (pending_cache_) {
+        for (const auto & d : pending_release_) {
+            pending_cache_->release_bundle(d);
+        }
+    }
+    pending_release_.clear();
+    pending_cache_ = nullptr;
+    pending_staged_.clear();
+}
+
+LayerPool::~LayerPool() {
+    drain_transfers();
+    if (event_) {
+        ggml_backend_event_free(event_);
     }
 }
 
@@ -731,6 +778,66 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
         }
         bytes.fetch_add(d.total_bytes, std::memory_order_relaxed);
     };
+    // Device pools with a transfer backend: issue each bundle's H2D copy as soon as it is resident, on the
+    // transfer stream, while the other workers are still reading; then hand the compute stream an event.
+    const bool async_dev = !host_pool_ && async_transfer();
+    std::mutex done_mtx;
+    std::condition_variable done_cv;
+    std::vector<size_t> done_list;
+    auto task_notify = [&](size_t i) {
+        task(i);
+        if (async_dev) {
+            std::lock_guard<std::mutex> lock(done_mtx);
+            done_list.push_back(i);
+            done_cv.notify_one();
+        }
+    };
+
+    if (async_dev) {
+        drain_transfers();                       // previous batch's copies are complete: release its slabs
+        workers_->start(work.size(), task_notify);
+        size_t issued = 0;
+        try {
+            while (issued < work.size()) {
+                size_t i;
+                {
+                    std::unique_lock<std::mutex> lock(done_mtx);
+                    done_cv.wait(lock, [&] { return !done_list.empty(); });
+                    i = done_list.back();
+                    done_list.pop_back();
+                }
+                const ExpertDescriptor & d = idx.get(work[i].first);
+                const uint8_t * src = cache ? views[i] : staged[i].data();
+                uint64_t off = 0;
+                for (size_t k = 0; k < d.slices.size(); ++k) {
+                    ggml_backend_tensor_set_async(transfer_, tensors_[k], src + off, (size_t) work[i].second * tensors_[k]->nb[2], d.slices[k].bytes);
+                    off += d.slices[k].bytes;
+                }
+                issued++;
+            }
+            workers_->wait();
+        } catch (...) {
+            workers_->wait();
+            ggml_backend_synchronize(transfer_);
+            if (cache) { for (size_t i = 0; i < work.size(); ++i) { if (views[i]) cache->release_bundle(idx.get(work[i].first)); } }
+            throw;
+        }
+        ggml_backend_event_record(event_, transfer_);
+        ggml_backend_event_wait(compute_, event_);   // the graph's next nodes wait on the GPU, not the host
+        event_pending_ = true;
+        if (cache) {
+            pending_cache_ = cache;
+            for (const auto & w : work) { pending_release_.push_back(idx.get(w.first)); }
+        } else {
+            pending_staged_ = std::move(staged);
+        }
+        for (const auto & w : work) {
+            slots_[w.second].state = SlotState::READY;
+        }
+        stats.bytes_read += bytes.load();
+        return;
+    }
+
     // no partial state is published on error: slots stay LOADING and the exception propagates
     workers_->run(work.size(), task);
 

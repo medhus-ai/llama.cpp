@@ -381,6 +381,14 @@ llama_context::llama_context(
         backends.emplace_back(backend_cpu);
 
         // create a list of the set_n_threads functions in the backends
+        if (model.moe_pool && model.moe_pool->device_) {
+            for (auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == model.moe_pool->device_) {
+                    model.moe_pool->attach_compute_backend(backend.get());
+                    break;
+                }
+            }
+        }
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;

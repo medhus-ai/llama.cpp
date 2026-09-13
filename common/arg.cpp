@@ -4534,6 +4534,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--moe-sync-io"},
+        "moe-stream-lab: copy experts to the device synchronously instead of on a dedicated transfer stream (A/B)",
+        [](common_params & params) {
+            params.moe_sync_io = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_SYNC_IO"));
+    add_opt(common_arg(
         {"--moe-host-cache"}, "SIZE",
         "moe-stream-lab: RAM cache of expert bundles in front of storage, e.g. 4G or 512M (default: off)",
         [](common_params & params, const std::string & value) {
