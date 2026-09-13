@@ -4534,6 +4534,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--moe-pack"}, "FNAME",
+        "moe-stream-lab: moepack sidecar to read experts from with --moe-store pack (default: <model>.moepack)",
+        [](common_params & params, const std::string & value) {
+            params.moe_pack_path = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PACK"));
+    add_opt(common_arg(
         {"--moe-io-threads"}, "N",
         "moe-stream-lab: number of workers fetching the missing experts of one ubatch (default 1 = sequential, for A/B)",
         [](common_params & params, int value) {
@@ -4559,11 +4566,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "moe-stream-lab: where the expert pool gets its bytes:\n"
         "- memory: resident tensors (default)\n"
         "- file: positional reads from the model file (page cache applies)\n"
-        "- direct: O_DIRECT reads from the model file, bypassing the page cache",
+        "- direct: O_DIRECT reads from the model file, bypassing the page cache\n"
+        "- pack: O_DIRECT reads of whole expert bundles from the moepack sidecar (see --moe-pack)",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "memory") { params.moe_store = 0; }
             else if (value == "file")   { params.moe_store = 1; }
             else if (value == "direct") { params.moe_store = 2; }
+            else if (value == "pack")   { params.moe_store = 3; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_MOE_STORE"));

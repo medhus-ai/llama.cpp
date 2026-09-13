@@ -189,15 +189,11 @@ DirectIOExpertStore::staging & DirectIOExpertStore::tls_staging() {
     return st;
 }
 
-void DirectIOExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
+void DirectIOExpertStore::read_range(uint64_t file_offset, uint64_t bytes, void * dst, const char * what) {
 #ifndef _WIN32
-    const TensorSlice & s = e.slices.at(slice);
-    if (s.file_offset == 0) {
-        throw std::runtime_error("moe: no file offset recorded for " + s.name);
-    }
-    const uint64_t begin   = (s.file_offset / align_) * align_;
-    const uint64_t end     = ((s.file_offset + s.bytes + align_ - 1) / align_) * align_;
-    const size_t   span    = (size_t) (end - begin);
+    const uint64_t begin = (file_offset / align_) * align_;
+    const uint64_t end   = ((file_offset + bytes + align_ - 1) / align_) * align_;
+    const size_t   span  = (size_t) (end - begin);
     uint8_t * buf = tls_staging().get(span, align_);
 
     size_t   got = 0;
@@ -205,29 +201,75 @@ void DirectIOExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, v
     while (got < span) {
         const ssize_t n = pread(fd_, buf + got, span - got, (off_t) (begin + got));
         if (n < 0) {
-            throw std::runtime_error("moe: read error for " + s.name + " at offset " + std::to_string(begin + got));
+            throw std::runtime_error(std::string("moe: read error for ") + what + " at offset " + std::to_string(begin + got));
         }
         if (n == 0) {
-            // a short final read is only legal past EOF, which must still cover the slice
-            if (begin + got < s.file_offset + s.bytes) {
-                throw std::runtime_error("moe: unexpected EOF reading " + s.name);
+            if (begin + got < file_offset + bytes) {
+                throw std::runtime_error(std::string("moe: unexpected EOF reading ") + what);
             }
             break;
         }
         got += (size_t) n;
         n_reads++;
     }
-    if (begin + got < s.file_offset + s.bytes) {
-        throw std::runtime_error("moe: short read for " + s.name);
+    if (begin + got < file_offset + bytes) {
+        throw std::runtime_error(std::string("moe: short read for ") + what);
     }
-    memcpy(dst, buf + (s.file_offset - begin), s.bytes);
+    memcpy(dst, buf + (file_offset - begin), bytes);
     reads_.fetch_add(n_reads, std::memory_order_relaxed);
     bytes_read_.fetch_add(got, std::memory_order_relaxed);
-    bytes_used_.fetch_add(s.bytes, std::memory_order_relaxed);
+    bytes_used_.fetch_add(bytes, std::memory_order_relaxed);
 #else
-    (void) e; (void) slice; (void) dst;
+    (void) file_offset; (void) bytes; (void) dst; (void) what;
     throw std::runtime_error("moe: DirectIOExpertStore is implemented for POSIX only");
 #endif
+}
+
+void DirectIOExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
+    const TensorSlice & s = e.slices.at(slice);
+    if (s.file_offset == 0) {
+        throw std::runtime_error("moe: no file offset recorded for " + s.name);
+    }
+    read_range(s.file_offset, s.bytes, dst, s.name.c_str());
+}
+
+PackExpertStore::PackExpertStore(const std::string & pack_path, bool direct) : direct_(direct) {
+    inner_ = std::make_unique<DirectIOExpertStore>(pack_path);
+    if (direct && !inner_->is_direct()) {
+        direct_ = false;
+    }
+}
+
+void PackExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
+    inner_->read_slice(e, slice, dst);
+}
+
+void PackExpertStore::read_bundle(const ExpertDescriptor & e, const std::vector<void *> & dsts) {
+    if (dsts.size() != e.slices.size()) {
+        throw std::runtime_error("moe: read_bundle: destination count != slice count");
+    }
+    bool adjacent = true;
+    for (size_t i = 1; i < e.slices.size(); ++i) {
+        if (e.slices[i].file_offset != e.slices[i - 1].file_offset + e.slices[i - 1].bytes) {
+            adjacent = false;
+            break;
+        }
+    }
+    if (!adjacent || e.slices.empty()) {
+        for (size_t i = 0; i < e.slices.size(); ++i) {
+            inner_->read_slice(e, i, dsts[i]);
+        }
+        return;
+    }
+    // one read for the whole bundle, then scatter into the per-tensor destinations
+    std::vector<uint8_t> & tmp = [] () -> std::vector<uint8_t> & { thread_local std::vector<uint8_t> t; return t; }();
+    tmp.resize(e.total_bytes);
+    inner_->read_range(e.slices[0].file_offset, e.total_bytes, tmp.data(), "expert bundle");
+    uint64_t off = 0;
+    for (size_t i = 0; i < e.slices.size(); ++i) {
+        memcpy(dsts[i], tmp.data() + off, e.slices[i].bytes);
+        off += e.slices[i].bytes;
+    }
 }
 
 VerifyingExpertStore::VerifyingExpertStore(std::unique_ptr<ExpertStore> primary, std::unique_ptr<ExpertStore> reference)
@@ -304,6 +346,28 @@ int LayerPool::pick_victim() const {
     return best;  // -1 if everything is IN_USE or LOADING
 }
 
+// Fetch every slice of `d` into `slot`. A PackExpertStore gets one bundle read; other stores one read per
+// slice. `staging` is the caller's scratch buffer (per thread).
+void LayerPool::fetch_into(ExpertStore & store, const ExpertDescriptor & d, int slot, std::vector<uint8_t> & staging) {
+    staging.resize(d.total_bytes);
+    std::vector<void *> dsts(d.slices.size());
+    uint64_t off = 0;
+    for (size_t i = 0; i < d.slices.size(); ++i) {
+        dsts[i] = staging.data() + off;
+        off += d.slices[i].bytes;
+    }
+    if (auto * pack = dynamic_cast<PackExpertStore *>(&store)) {
+        pack->read_bundle(d, dsts);
+    } else {
+        for (size_t i = 0; i < d.slices.size(); ++i) {
+            store.read_slice(d, i, dsts[i]);
+        }
+    }
+    for (size_t i = 0; i < d.slices.size(); ++i) {
+        ggml_backend_tensor_set(tensors_[i], dsts[i], (size_t) slot * tensors_[i]->nb[2], d.slices[i].bytes);
+    }
+}
+
 void LayerPool::load(const ExpertIndex & idx, ExpertStore & store, ExpertKey k, int slot, PoolStats & stats) {
     const ExpertDescriptor & d = idx.get(k);
     if (d.slices.size() != tensors_.size()) {
@@ -315,17 +379,14 @@ void LayerPool::load(const ExpertIndex & idx, ExpertStore & store, ExpertKey k, 
     s.generation++;
     for (size_t i = 0; i < d.slices.size(); ++i) {
         const TensorSlice & sl = d.slices[i];
-        ggml_tensor * pt = tensors_[i];
-        const uint64_t slot_bytes = pt->nb[2];
+        const uint64_t slot_bytes = tensors_[i]->nb[2];
         if (sl.bytes != slot_bytes) {
             throw std::runtime_error("moe: slice bytes (" + std::to_string(sl.bytes) + ") != pool slot bytes (" +
                                      std::to_string(slot_bytes) + ") for " + sl.name);
         }
-        staging_.resize(sl.bytes);
-        store.read_slice(d, i, staging_.data());
-        ggml_backend_tensor_set(pt, staging_.data(), (size_t) slot * slot_bytes, sl.bytes);
-        stats.bytes_read += sl.bytes;
     }
+    fetch_into(store, d, slot, staging_);
+    stats.bytes_read += d.total_bytes;
     s.state = SlotState::READY;
 }
 
@@ -373,18 +434,13 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
                         throw std::runtime_error("moe: descriptor slice count != pool tensor count");
                     }
                     for (size_t k = 0; k < d.slices.size(); ++k) {
-                        const TensorSlice & sl = d.slices[k];
-                        ggml_tensor * pt = tensors_[k];
-                        const uint64_t slot_bytes = pt->nb[2];
-                        if (sl.bytes != slot_bytes) {
-                            throw std::runtime_error("moe: slice bytes != pool slot bytes for " + sl.name);
+                        if (d.slices[k].bytes != (uint64_t) tensors_[k]->nb[2]) {
+                            throw std::runtime_error("moe: slice bytes != pool slot bytes for " + d.slices[k].name);
                         }
-                        buf.resize(sl.bytes);
-                        store.read_slice(d, k, buf.data());
-                        // disjoint byte ranges of the same tensor, one slot per worker at a time
-                        ggml_backend_tensor_set(pt, buf.data(), (size_t) slot * slot_bytes, sl.bytes);
-                        bytes.fetch_add(sl.bytes, std::memory_order_relaxed);
                     }
+                    // disjoint byte ranges of the same tensors, one slot per worker at a time
+                    fetch_into(store, d, slot, buf);
+                    bytes.fetch_add(d.total_bytes, std::memory_order_relaxed);
                 }
             } catch (...) {
                 errors[t] = std::current_exception();
