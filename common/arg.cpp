@@ -4535,7 +4535,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
         {"--moe-prefetch"}, "K",
-        "moe-stream-lab: prerouter prefetch - run the next MoE layer's own router on the current residual stream and pull its top-K experts into the host tier ahead of demand (0 = off; needs --moe-host-cache)",
+        "moe-stream-lab: prerouter prefetch - run the next MoE layer's own router on the current residual stream and pull its top-K experts into the host tier ahead of demand (needs --moe-host-cache; defaults to 12 when a host cache is set, -1 = off)",
         [](common_params & params, int value) {
             params.moe_prefetch_k = value;
         }

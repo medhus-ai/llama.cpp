@@ -1702,6 +1702,15 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_host_cache_bytes = params.moe_host_cache_bytes;
     mparams.moe_sync_io     = params.moe_sync_io;
     mparams.moe_prefetch_k  = params.moe_prefetch_k;
+    if (params.moe_pool_slots > 0 && params.moe_host_cache_bytes > 0 && params.moe_prefetch_k == 0) {
+        // the prerouter prefetches into the host tier, so it only helps when a tier exists
+        mparams.moe_prefetch_k = LLAMA_MOE_PREFETCH_K_DEFAULT;
+        LOG_INF("%s: host cache is set, enabling prerouter prefetch (--moe-prefetch %d, use -1 to disable)\n",
+                __func__, LLAMA_MOE_PREFETCH_K_DEFAULT);
+    }
+    if (mparams.moe_prefetch_k < 0) {
+        mparams.moe_prefetch_k = 0;
+    }
     mparams.moe_prefetch_lookahead = params.moe_prefetch_lookahead;
     mparams.moe_prefetch_src = params.moe_prefetch_src.empty() ? nullptr : params.moe_prefetch_src.c_str();
     mparams.moe_prefetch_margin = params.moe_prefetch_margin;

@@ -50,6 +50,10 @@
 
 #ifdef __cplusplus
 extern "C" {
+
+    // moe-stream-lab: prerouter top-k used when --moe-host-cache is set and --moe-prefetch is not given
+    #define LLAMA_MOE_PREFETCH_K_DEFAULT 12
+
 #endif
 
     //
