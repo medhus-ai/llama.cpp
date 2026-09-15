@@ -1,0 +1,39 @@
+name: ssd-moe macOS (Apple Silicon, Metal)
+
+# Build check for the moe-stream-lab expert runtime on Apple Silicon. Upstream workflows only run on master,
+# so this is the only CI that runs on the feature branch. It proves the code compiles and the pool's unit tests
+# pass; it does not run a model (hosted runners lack the RAM and disk for a 19 GB GGUF).
+on:
+  push:
+    branches: [feature/ssd-moe]
+    paths:
+      - 'src/moe-runtime/**'
+      - 'src/llama-moe-pool.*'
+      - 'src/llama-graph.*'
+      - 'src/llama-context.cpp'
+      - 'common/moe-trace.*'
+      - 'tests/test-moe-pool.cpp'
+      - '.github/workflows/ssd-moe-macos.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ssd-moe-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Metal)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DLLAMA_CURL=OFF
+
+      - name: Build
+        run: cmake --build build -j $(sysctl -n hw.logicalcpu) --target test-moe-pool llama-completion
+
+      - name: Unit tests
+        run: ./build/bin/test-moe-pool
+
+      - name: Binary carries the expert-runtime flags
+        run: ./build/bin/llama-completion --help | grep -E -- '--moe-store|--moe-pool-slots'
