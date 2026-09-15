@@ -478,6 +478,9 @@ void llama_moe_pool::init_prerouter(llama_model & model, int k, int lookahead, c
     prerouter_.layers.clear();
     for (uint32_t il : index_.moe_layers) {
         auto & L = model.layers[il];
+        if (prerouter_in_graph_) {
+            continue; // the graph computes the predictions; only the CPU prerouter needs host copies of the routers
+        }
         if (!L.attn_norm || !L.ffn_gate_inp) {
             throw std::runtime_error("moe prerouter: layer " + std::to_string(il) + " lacks attn_norm/ffn_gate_inp");
         }

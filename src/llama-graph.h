@@ -19,6 +19,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_model;
 
 struct llama_memory_context_i;
 
@@ -810,6 +811,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    const llama_model * model = nullptr; // moe-stream-lab: the prerouter reads a later MoE layer's router
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1036,6 +1039,8 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    const llama_model * moe_model = nullptr;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
@@ -1110,6 +1115,8 @@ struct llm_graph_context {
                      int   il) const;
 
     // build MoE FFN without bias tensors
+    void build_moe_prerouter(ggml_tensor * router_inp, int il, llama_expert_gating_func_type gating_op) const;
+
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,

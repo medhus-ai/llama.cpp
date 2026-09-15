@@ -1493,7 +1493,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    moe_model        (params.model) {
         res->set_params(params);
     }
 
@@ -1990,6 +1991,57 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     );
 }
 
+// moe-stream-lab: run the router of a later MoE layer on this layer's router input and publish its top-k. Nothing in
+// the graph consumes it; the expert pool prefetches those experts into the host tier. Routing is unchanged.
+void llm_graph_context::build_moe_prerouter(ggml_tensor * router_inp, int il, llama_expert_gating_func_type gating_op) const {
+    if (!hparams.moe_pool_active || hparams.moe_prefetch_k <= 0 || moe_model == nullptr) {
+        return;
+    }
+    const auto & layers = moe_model->layers;
+    int target = -1;
+    for (int j = il + 1, seen = 0; j < (int) layers.size(); ++j) {
+        if (layers[j].ffn_gate_inp && ++seen == hparams.moe_prefetch_lookahead) {
+            target = j;
+            break;
+        }
+    }
+    if (target < 0) {
+        return;
+    }
+    // the norm that feeds each layer's FFN: rescale this layer's normed input to the target's
+    auto ffn_inp_norm = [&](int l) -> ggml_tensor * {
+        const auto & L = layers[l];
+        return L.ffn_norm ? L.ffn_norm : L.attn_post_norm ? L.attn_post_norm : L.attn_norm;
+    };
+    const int64_t n_embd_r = router_inp->ne[0];
+    ggml_tensor * xn = router_inp;
+    ggml_tensor * ns = ffn_inp_norm(il);
+    ggml_tensor * nt = ffn_inp_norm(target);
+    if (ns && nt && ns->ne[0] == n_embd_r && nt->ne[0] == n_embd_r) {
+        xn = ggml_mul(ctx0, ggml_div(ctx0, router_inp, ns), nt);
+    }
+    ggml_tensor * pl = build_lora_mm(layers[target].ffn_gate_inp, xn); // [n_expert, n_tokens]
+    if (layers[target].ffn_gate_inp_b) {
+        pl = ggml_add(ctx0, pl, layers[target].ffn_gate_inp_b);
+    }
+    switch (gating_op) {
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:       pl = ggml_soft_max(ctx0, pl); break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:       pl = ggml_sigmoid(ctx0, pl);  break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: pl = ggml_sqrt(ctx0, ggml_softplus(ctx0, pl)); break;
+        default: break;
+    }
+    if (layers[target].ffn_exp_probs_b) {
+        pl = ggml_add(ctx0, pl, layers[target].ffn_exp_probs_b);
+    }
+    const int k = std::min<int>(hparams.moe_prefetch_k, (int) pl->ne[0]);
+    ggml_tensor * pids = ggml_argsort_top_k(ctx0, pl, k); // [k, n_tokens]
+    cb(pids, "ffn_moe_prefetch_ids", il);
+    ggml_build_forward_expand(gf, pids);
+    ggml_tensor * pval = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, pl, 1, pl->ne[0], pl->ne[1]), pids);
+    cb(pval, "ffn_moe_prefetch_probs", il);
+    ggml_build_forward_expand(gf, pval);
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2110,6 +2162,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+
+    // moe-stream-lab: models that pass precomputed logits call build_moe_prerouter() with their router input
+    if (probs_in == nullptr && selected_experts_in == nullptr) {
+        build_moe_prerouter(cur, il, gating_op);
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
