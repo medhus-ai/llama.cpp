@@ -322,38 +322,7 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(ggml_tensor * cur, 
 
         ggml_tensor * router_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
         cb(router_logits, "ffn_moe_logits", il);
-
-        // moe-stream-lab in-graph prerouter: run the router of the MoE layer `lookahead` MoE layers ahead on
-        // this layer's normed input (rescaled from this layer's norm weight to the target's) and publish its
-        // top-k as ffn_moe_prefetch_ids-<il>. Nothing consumes it in the graph; the expert pool reads it in
-        // its callback and prefetches those experts into the host tier. Routing itself is untouched.
-        if (hparams.moe_pool_active && hparams.moe_prefetch_k > 0) {
-            int target = -1;
-            int seen = 0;
-            for (int j = il + 1; j < (int) model.layers.size(); ++j) {
-                if (model.layers[j].ffn_gate_inp) {
-                    if (++seen == hparams.moe_prefetch_lookahead) { target = j; break; }
-                }
-            }
-            if (target >= 0 && model.layers[il].attn_norm && model.layers[target].attn_norm) {
-                ggml_tensor * xn = ggml_div(ctx0, cur, model.layers[il].attn_norm);
-                xn = ggml_mul(ctx0, xn, model.layers[target].attn_norm);
-                ggml_tensor * pl = ggml_mul_mat(ctx0, model.layers[target].ffn_gate_inp, xn);   // [n_expert, n_tokens]
-                pl = ggml_sigmoid(ctx0, pl);
-                if (model.layers[target].ffn_exp_probs_b) {
-                    pl = ggml_add(ctx0, pl, model.layers[target].ffn_exp_probs_b);
-                }
-                const int k = std::min<int>(hparams.moe_prefetch_k, (int) pl->ne[0]);
-                ggml_tensor * pids = ggml_argsort_top_k(ctx0, pl, k);   // [k, n_tokens], I32
-                cb(pids, "ffn_moe_prefetch_ids", il);
-                ggml_build_forward_expand(gf, pids);
-                // the candidates' probabilities, so the pool can apply a confidence margin (item 2)
-                ggml_tensor * pl3  = ggml_reshape_3d(ctx0, pl, 1, pl->ne[0], pl->ne[1]);
-                ggml_tensor * pval = ggml_get_rows(ctx0, pl3, pids);      // [1, k, n_tokens]
-                cb(pval, "ffn_moe_prefetch_probs", il);
-                ggml_build_forward_expand(gf, pval);
-            }
-        }
+        build_moe_prerouter(cur, il, LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID);
 
         ggml_tensor * moe_out =
             build_moe_ffn(inp_latent,
