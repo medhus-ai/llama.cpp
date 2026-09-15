@@ -15,6 +15,9 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
+#ifdef LLAMA_MOE_IO_URING
+#include <liburing.h>
+#endif
 #else
 #include <cstdio>
 #endif
@@ -231,6 +234,185 @@ void DirectIOExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, v
         throw std::runtime_error("moe: no file offset recorded for " + s.name);
     }
     read_range(s.file_offset, s.bytes, dst, s.name.c_str());
+}
+
+IoUringExpertStore::IoUringExpertStore(const std::string & path, unsigned queue_depth) : path_(path), depth_(queue_depth) {
+#ifndef _WIN32
+    const size_t bs = device_logical_block_size(path);
+    align_ = bs ? bs : 4096;
+    fd_ = open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (fd_ >= 0) {
+        direct_ = true;
+    } else {
+        fd_ = open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) {
+            throw std::runtime_error("moe: cannot open model file for expert reads: " + path);
+        }
+        fprintf(stderr, "moe: O_DIRECT is not available for %s, io_uring store falls back to buffered reads\n", path.c_str());
+    }
+#ifdef LLAMA_MOE_IO_URING
+    auto * ring = new io_uring();
+    if (io_uring_queue_init(depth_, ring, 0) == 0) {
+        ring_ = ring;
+        ring_ok_ = true;
+    } else {
+        delete ring;
+        fprintf(stderr, "moe: io_uring_queue_init failed, io_uring store falls back to pread\n");
+    }
+#else
+    fprintf(stderr, "moe: built without liburing, io_uring store falls back to pread\n");
+#endif
+    name_ = std::string(ring_ok_ ? "uring" : "uring(fallback:pread)") + (direct_ ? "" : "(buffered)");
+    fprintf(stderr, "moe: io_uring store on %s, alignment %zu bytes, O_DIRECT %s, ring %s (depth %u)\n",
+            path.c_str(), align_, direct_ ? "on" : "off", ring_ok_ ? "on" : "off", depth_);
+#else
+    throw std::runtime_error("moe: IoUringExpertStore is implemented for Linux only");
+#endif
+}
+
+IoUringExpertStore::~IoUringExpertStore() {
+#ifndef _WIN32
+#ifdef LLAMA_MOE_IO_URING
+    if (ring_) {
+        io_uring_queue_exit((io_uring *) ring_);
+        delete (io_uring *) ring_;
+    }
+#endif
+    if (arena_) {
+        free(arena_);
+    }
+    if (fd_ >= 0) {
+        close(fd_);
+    }
+#endif
+}
+
+void IoUringExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
+    const TensorSlice & s = e.slices.at(slice);
+    if (s.file_offset == 0) {
+        throw std::runtime_error("moe: no file offset recorded for " + s.name);
+    }
+    read_batch({ BatchRead{ s.file_offset, s.bytes, dst, s.name.c_str() } });
+}
+
+void IoUringExpertStore::read_batch(const std::vector<BatchRead> & reqs) {
+#ifndef _WIN32
+    if (reqs.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    // cover ranges, laid out back to back in one aligned arena
+    struct span_t { uint64_t begin; size_t span; size_t arena_off; };
+    std::vector<span_t> spans(reqs.size());
+    size_t total = 0;
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        const uint64_t begin = (reqs[i].file_offset / align_) * align_;
+        const uint64_t end   = ((reqs[i].file_offset + reqs[i].bytes + align_ - 1) / align_) * align_;
+        spans[i] = { begin, (size_t) (end - begin), total };
+        total += (size_t) (end - begin);
+    }
+    if (arena_cap_ < total) {
+        if (arena_) {
+            free(arena_);
+            arena_ = nullptr;
+        }
+        void * p = nullptr;
+        if (posix_memalign(&p, align_, total) != 0 || !p) {
+            throw std::runtime_error("moe: cannot allocate an aligned io_uring arena of " + std::to_string(total) + " bytes");
+        }
+        arena_ = (uint8_t *) p;
+        arena_cap_ = total;
+    }
+
+    uint64_t n_reads = 0;
+#ifdef LLAMA_MOE_IO_URING
+    if (ring_ok_) {
+        auto * ring = (io_uring *) ring_;
+        // each request may need several SQEs (short reads are completed by re-submitting the remainder)
+        std::vector<size_t> got(reqs.size(), 0);
+        size_t pending = 0;
+        size_t next = 0;
+        size_t done = 0;
+        auto submit_one = [&](size_t i) {
+            io_uring_sqe * sqe = io_uring_get_sqe(ring);
+            if (!sqe) {
+                return false;
+            }
+            io_uring_prep_read(sqe, fd_, arena_ + spans[i].arena_off + got[i], (unsigned) (spans[i].span - got[i]),
+                               (__u64) (spans[i].begin + got[i]));
+            io_uring_sqe_set_data64(sqe, (__u64) i);
+            pending++;
+            return true;
+        };
+        while (done < reqs.size()) {
+            while (next < reqs.size() && pending < depth_ && submit_one(next)) {
+                next++;
+            }
+            const int rc = io_uring_submit_and_wait(ring, 1);
+            if (rc < 0) {
+                throw std::runtime_error("moe: io_uring_submit_and_wait failed: " + std::to_string(-rc));
+            }
+            io_uring_cqe * cqe = nullptr;
+            unsigned head = 0;
+            unsigned seen = 0;
+            io_uring_for_each_cqe(ring, head, cqe) {
+                seen++;
+                pending--;
+                const size_t i = (size_t) io_uring_cqe_get_data64(cqe);
+                if (cqe->res < 0) {
+                    io_uring_cq_advance(ring, seen);
+                    throw std::runtime_error(std::string("moe: io_uring read error for ") + reqs[i].what + ": " + std::to_string(-cqe->res));
+                }
+                n_reads++;
+                got[i] += (size_t) cqe->res;
+                if (got[i] >= spans[i].span || cqe->res == 0) {
+                    if (spans[i].begin + got[i] < reqs[i].file_offset + reqs[i].bytes) {
+                        io_uring_cq_advance(ring, seen);
+                        throw std::runtime_error(std::string("moe: short io_uring read for ") + reqs[i].what);
+                    }
+                    done++;
+                } else if (!submit_one(i)) {
+                    io_uring_cq_advance(ring, seen);
+                    throw std::runtime_error("moe: io_uring queue full while re-submitting a short read");
+                }
+            }
+            io_uring_cq_advance(ring, seen);
+        }
+    } else
+#endif
+    {
+        for (size_t i = 0; i < reqs.size(); ++i) {
+            size_t g = 0;
+            while (g < spans[i].span) {
+                const ssize_t n = pread(fd_, arena_ + spans[i].arena_off + g, spans[i].span - g, (off_t) (spans[i].begin + g));
+                if (n < 0) {
+                    throw std::runtime_error(std::string("moe: read error for ") + reqs[i].what);
+                }
+                if (n == 0) {
+                    break;
+                }
+                g += (size_t) n;
+                n_reads++;
+            }
+            if (spans[i].begin + g < reqs[i].file_offset + reqs[i].bytes) {
+                throw std::runtime_error(std::string("moe: short read for ") + reqs[i].what);
+            }
+        }
+    }
+
+    uint64_t used = 0;
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        memcpy(reqs[i].dst, arena_ + spans[i].arena_off + (reqs[i].file_offset - spans[i].begin), reqs[i].bytes);
+        used += reqs[i].bytes;
+    }
+    reads_.fetch_add(n_reads, std::memory_order_relaxed);
+    bytes_read_.fetch_add(total, std::memory_order_relaxed);
+    bytes_used_.fetch_add(used, std::memory_order_relaxed);
+#else
+    (void) reqs;
+    throw std::runtime_error("moe: IoUringExpertStore is implemented for Linux only");
+#endif
 }
 
 PackExpertStore::PackExpertStore(const std::string & pack_path, bool direct) : direct_(direct) {
@@ -757,10 +939,52 @@ void LayerPool::load(const ExpertIndex & idx, ExpertStore & store, ExpertKey k, 
     s.state = SlotState::READY;
 }
 
+void LayerPool::load_many_uring(const ExpertIndex & idx, IoUringExpertStore & store,
+                                const std::vector<std::pair<ExpertKey, int>> & work, PoolStats & stats) {
+    std::vector<BatchRead> reqs;
+    reqs.reserve(work.size() * tensors_.size());
+    uint64_t bytes = 0;
+    for (const auto & w : work) {
+        const ExpertDescriptor & d = idx.get(w.first);
+        if (d.slices.size() != tensors_.size()) {
+            throw std::runtime_error("moe: descriptor slice count != pool tensor count");
+        }
+        Slot & sl = slots_[w.second];
+        sl.state = SlotState::LOADING;
+        sl.key   = w.first;
+        sl.generation++;
+        for (size_t k = 0; k < d.slices.size(); ++k) {
+            const TensorSlice & s = d.slices[k];
+            if (s.bytes != (uint64_t) tensors_[k]->nb[2]) {
+                throw std::runtime_error("moe: slice bytes != pool slot bytes for " + s.name);
+            }
+            if (s.file_offset == 0) {
+                throw std::runtime_error("moe: no file offset recorded for " + s.name);
+            }
+            // host pool: the slot's bytes live in host memory, read straight into them
+            uint8_t * dst = (uint8_t *) tensors_[k]->data + (size_t) w.second * tensors_[k]->nb[2];
+            reqs.push_back(BatchRead{ s.file_offset, s.bytes, dst, s.name.c_str() });
+        }
+        bytes += d.total_bytes;
+    }
+    store.read_batch(reqs);   // no partial state on error: slots stay LOADING and the exception propagates
+    for (const auto & w : work) {
+        slots_[w.second].state = SlotState::READY;
+    }
+    stats.bytes_read += bytes;
+}
+
 void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
                           const std::vector<std::pair<ExpertKey, int>> & work, PoolStats & stats) {
     if (work.empty()) {
         return;
+    }
+    if (host_pool_) {
+        // one thread drives the whole batch through the ring: no fetch workers, no per-thread arenas
+        if (auto * uring = dynamic_cast<IoUringExpertStore *>(&store); uring && uring->available()) {
+            load_many_uring(idx, *uring, work, stats);
+            return;
+        }
     }
     const uint32_t n_threads = std::min<uint32_t>(io_threads_, (uint32_t) work.size());
 

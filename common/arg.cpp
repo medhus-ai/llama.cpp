@@ -4616,7 +4616,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_VERIFY"));
     add_opt(common_arg(
         {"--moe-store"}, "MODE",
-        "moe-stream-lab: where the expert pool gets its bytes:\n"
+        "moe-stream-lab: where the expert pool gets its bytes (uring = O_DIRECT through io_uring, one submit per ubatch):\n"
         "- memory: resident tensors (default)\n"
         "- file: positional reads from the model file (page cache applies)\n"
         "- direct: O_DIRECT reads from the model file, bypassing the page cache\n"
@@ -4626,6 +4626,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else if (value == "file")   { params.moe_store = 1; }
             else if (value == "direct") { params.moe_store = 2; }
             else if (value == "pack")   { params.moe_store = 3; }
+            else if (value == "uring")  { params.moe_store = 4; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_MOE_STORE"));

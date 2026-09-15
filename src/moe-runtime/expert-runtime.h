@@ -133,6 +133,48 @@ private:
     std::atomic<uint64_t> bytes_used_{0};
 };
 
+// Reads expert bytes with O_DIRECT through io_uring: read_batch() submits every cover range of a ubatch's
+// misses in one call and reaps them together, so one thread drives the NVMe queue instead of one thread per
+// in-flight read. read_slice() is the same reader with a batch of one. Falls back to DirectIOExpertStore
+// semantics when the build has no liburing (name() says so).
+struct BatchRead {
+    uint64_t file_offset;
+    uint64_t bytes;
+    void *   dst;
+    const char * what;
+};
+
+class IoUringExpertStore : public ExpertStore {
+public:
+    explicit IoUringExpertStore(const std::string & path, unsigned queue_depth = 64);
+    ~IoUringExpertStore() override;
+
+    void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
+    void read_batch(const std::vector<BatchRead> & reqs);
+    const char * name() const override { return name_.c_str(); }
+    bool available() const { return ring_ok_; }
+
+    uint64_t reads() const { return reads_.load(); }
+    uint64_t bytes_read() const { return bytes_read_.load(); }
+    uint64_t bytes_used() const { return bytes_used_.load(); }
+
+private:
+    std::string path_;
+    std::string name_;
+    int         fd_      = -1;
+    bool        direct_  = false;
+    bool        ring_ok_ = false;
+    size_t      align_   = 4096;
+    unsigned    depth_   = 64;
+    void *      ring_    = nullptr;   // struct io_uring, opaque here so the header needs no liburing
+    uint8_t *   arena_   = nullptr;   // one aligned staging arena for the whole batch
+    size_t      arena_cap_ = 0;
+    std::mutex  mtx_;                 // one ring, one batch at a time
+    std::atomic<uint64_t> reads_{0};
+    std::atomic<uint64_t> bytes_read_{0};
+    std::atomic<uint64_t> bytes_used_{0};
+};
+
 // Reads expert bytes from a moepack sidecar (tools/moe-pack): every expert is one contiguous, aligned
 // bundle, so a whole expert is fetched with a single O_DIRECT read instead of one unaligned read per
 // tensor. TensorSlice::file_offset must point into the pack (set by the adapter from the .moeidx).
@@ -327,6 +369,8 @@ private:
     int find(ExpertKey k) const;
     int pick_victim() const;
     void load(const ExpertIndex & idx, ExpertStore & store, ExpertKey k, int slot, PoolStats & stats);
+    void load_many_uring(const ExpertIndex & idx, IoUringExpertStore & store,
+                         const std::vector<std::pair<ExpertKey, int>> & work, PoolStats & stats);
     void fetch_into(ExpertStore & store, const ExpertDescriptor & d, int slot, std::vector<uint8_t> & staging);
     void publish(const ExpertDescriptor & d, int slot, const std::vector<uint8_t> & staging);
     // fetch several (key, slot) pairs, using io_threads_ workers; byte counts are accumulated per worker
