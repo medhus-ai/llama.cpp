@@ -275,6 +275,7 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         case 1:  store_ = std::make_unique<moe::BufferedFileExpertStore>(model_path); break;
         case 2:  store_ = std::make_unique<moe::DirectIOExpertStore>(model_path);   break;
         case 3:  store_ = std::make_unique<moe::PackExpertStore>(pack_path);        break;
+        case 4:  store_ = std::make_unique<moe::IoUringExpertStore>(model_path);    break;
         default: throw std::runtime_error("moe pool: unknown store mode " + std::to_string(store_mode));
     }
     if (host_cache_bytes > 0 && store_mode >= 1) {
