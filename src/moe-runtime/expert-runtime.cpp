@@ -586,9 +586,10 @@ int CachingExpertStore::resident_index(const ExpertDescriptor & e, bool is_prefe
         slabs_[reserved].state = St::READY;
         slabs_[reserved].prefetched = is_prefetch;
         n_ready_++;
-        stats_.bytes_inserted += bundle_bytes_;
+        stats_.bytes_inserted += e.total_bytes;
         if (is_prefetch) {
             stats_.prefetched++;
+            stats_.bytes_prefetched += e.total_bytes;
         }
         i = reserved;
         cv_.notify_all();
@@ -597,7 +598,7 @@ int CachingExpertStore::resident_index(const ExpertDescriptor & e, bool is_prefe
             // already resident: nothing to do, and not a prediction that helped
         } else {
             stats_.hits++;
-            stats_.bytes_from_cache += bundle_bytes_;
+            stats_.bytes_from_cache += e.total_bytes;
             if (slabs_[i].prefetched) {
                 slabs_[i].prefetched = false;
                 stats_.prefetch_useful++;
@@ -616,7 +617,7 @@ bool CachingExpertStore::contains(ExpertKey k) const {
 }
 
 bool CachingExpertStore::prefetch(const ExpertDescriptor & e) {
-    if (n_slots_ == 0 || e.total_bytes != bundle_bytes_) {
+    if (n_slots_ == 0 || e.total_bytes > bundle_bytes_) {
         return false;
     }
     if (contains(e.key)) {
@@ -630,7 +631,7 @@ bool CachingExpertStore::prefetch(const ExpertDescriptor & e) {
 }
 
 const uint8_t * CachingExpertStore::acquire_bundle(const ExpertDescriptor & e) {
-    if (n_slots_ == 0 || e.total_bytes != bundle_bytes_) {
+    if (n_slots_ == 0 || e.total_bytes > bundle_bytes_) {
         throw std::runtime_error("moe: acquire_bundle on a pass-through host cache");
     }
     const int i = resident_index(e);
@@ -647,8 +648,8 @@ void CachingExpertStore::release_bundle(const ExpertDescriptor & e) {
 }
 
 void CachingExpertStore::read_bundle(const ExpertDescriptor & e, const std::vector<void *> & dsts) {
-    if (n_slots_ == 0 || e.total_bytes != bundle_bytes_) {
-        // pass-through (cache disabled or a descriptor of a different size)
+    if (n_slots_ == 0 || e.total_bytes > bundle_bytes_) {
+        // pass-through (cache disabled or a descriptor larger than a slab)
         for (size_t i = 0; i < e.slices.size(); ++i) {
             inner_->read_slice(e, i, dsts[i]);
         }
@@ -1044,8 +1045,18 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
     std::mutex done_mtx;
     std::condition_variable done_cv;
     std::vector<size_t> done_list;
+    bool task_failed = false;
     auto task_notify = [&](size_t i) {
-        task(i);
+        try {
+            task(i);
+        } catch (...) {
+            if (async_dev) {
+                std::lock_guard<std::mutex> lock(done_mtx);
+                task_failed = true;
+                done_cv.notify_one();
+            }
+            throw;
+        }
         if (async_dev) {
             std::lock_guard<std::mutex> lock(done_mtx);
             done_list.push_back(i);
@@ -1062,7 +1073,10 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
                 size_t i;
                 {
                     std::unique_lock<std::mutex> lock(done_mtx);
-                    done_cv.wait(lock, [&] { return !done_list.empty(); });
+                    done_cv.wait(lock, [&] { return task_failed || !done_list.empty(); });
+                    if (done_list.empty()) {
+                        break; // a worker failed: wait() below rethrows its error
+                    }
                     i = done_list.back();
                     done_list.pop_back();
                 }
