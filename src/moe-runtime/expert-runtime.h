@@ -222,7 +222,7 @@ public:
     const char * name() const override { return name_.c_str(); }
 
     struct Stats { uint64_t hits = 0, misses = 0, bytes_from_cache = 0, bytes_inserted = 0, evictions = 0;
-                   uint64_t prefetched = 0, prefetch_useful = 0, prefetch_wasted = 0; };
+                   uint64_t prefetched = 0, prefetch_useful = 0, prefetch_wasted = 0, bytes_prefetched = 0; };
     bool contains(ExpertKey k) const;
     // Make `e` resident as a prefetch (no copy out). Counted as useful when a later demand read hits it
     // before eviction, wasted when it is evicted unused. Returns false if it was already resident.

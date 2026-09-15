@@ -285,7 +285,12 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
         }
-        auto cache = std::make_unique<moe::CachingExpertStore>(std::move(store_), host_cache_bytes, index_.descs[0].total_bytes, host_buft);
+        // quant mixes give layers different expert sizes, so a slab must hold the largest one
+        uint64_t max_bundle = 0;
+        for (const auto & d : index_.descs) {
+            max_bundle = std::max(max_bundle, d.total_bytes);
+        }
+        auto cache = std::make_unique<moe::CachingExpertStore>(std::move(store_), host_cache_bytes, max_bundle, host_buft);
         host_cache_ = cache.get();
         store_ = std::move(cache);
     }
@@ -388,7 +393,7 @@ std::string llama_moe_pool::stats_json() const {
                      (unsigned long long) prerouter_.predictions, (unsigned long long) prerouter_.issued,
                      (unsigned long long) hs.prefetched, (unsigned long long) hs.prefetch_useful,
                      (unsigned long long) hs.prefetch_wasted, (unsigned long long) prerouter_.dropped,
-                     (unsigned long long) (hs.prefetched * index_.descs[0].total_bytes));
+                     (unsigned long long) hs.bytes_prefetched);
             out += pb;
         }
     }
