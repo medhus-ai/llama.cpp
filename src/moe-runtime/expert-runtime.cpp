@@ -13,7 +13,9 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef __linux__
 #include <sys/sysmacros.h>
+#endif
 #include <unistd.h>
 #ifdef LLAMA_MOE_IO_URING
 #include <liburing.h>
@@ -100,6 +102,10 @@ void BufferedFileExpertStore::read_slice(const ExpertDescriptor & e, size_t slic
 #ifndef _WIN32
 // Logical block size of the device holding `path`, or 0 if it cannot be determined.
 static size_t device_logical_block_size(const std::string & path) {
+#ifndef __linux__
+    (void) path;
+    return 0; // no sysfs: callers use 4096
+#else
     struct stat st;
     if (stat(path.c_str(), &st) != 0) {
         return 0;
@@ -121,6 +127,30 @@ static size_t device_logical_block_size(const std::string & path) {
     const int n = fscanf(f, "%u", &v);
     fclose(f);
     return n == 1 ? (size_t) v : 0;
+#endif
+}
+
+#ifdef __APPLE__
+#define MOE_UNCACHED_NAME "F_NOCACHE"
+#else
+#define MOE_UNCACHED_NAME "O_DIRECT"
+#endif
+
+// Open `path` read-only bypassing the page cache (O_DIRECT, or F_NOCACHE on macOS); falls back to a plain
+// open with `direct` = false. Returns -1 if the file cannot be opened at all.
+static int open_uncached(const std::string & path, bool & direct) {
+#ifdef __APPLE__
+    const int fd = open(path.c_str(), O_RDONLY);
+    direct = fd >= 0 && fcntl(fd, F_NOCACHE, 1) == 0;
+    return fd;
+#else
+    int fd = open(path.c_str(), O_RDONLY | O_DIRECT);
+    direct = fd >= 0;
+    if (fd < 0) {
+        fd = open(path.c_str(), O_RDONLY);
+    }
+    return fd;
+#endif
 }
 #endif
 
@@ -129,19 +159,15 @@ DirectIOExpertStore::DirectIOExpertStore(const std::string & path) : path_(path)
     const size_t bs = device_logical_block_size(path);
     align_ = bs ? bs : 4096;
 
-    fd_ = open(path.c_str(), O_RDONLY | O_DIRECT);
-    if (fd_ >= 0) {
-        direct_ = true;
-    } else {
-        fd_ = open(path.c_str(), O_RDONLY);
-        if (fd_ < 0) {
-            throw std::runtime_error("moe: cannot open model file for expert reads: " + path);
-        }
-        direct_ = false;
-        fprintf(stderr, "moe: O_DIRECT is not available for %s, falling back to buffered reads "
+    fd_ = open_uncached(path, direct_);
+    if (fd_ < 0) {
+        throw std::runtime_error("moe: cannot open model file for expert reads: " + path);
+    }
+    if (!direct_) {
+        fprintf(stderr, "moe: " MOE_UNCACHED_NAME " is not available for %s, falling back to buffered reads "
                         "(measurements will include page-cache effects)\n", path.c_str());
     }
-    fprintf(stderr, "moe: direct store on %s, alignment %zu bytes, O_DIRECT %s\n",
+    fprintf(stderr, "moe: direct store on %s, alignment %zu bytes, " MOE_UNCACHED_NAME " %s\n",
             path.c_str(), align_, direct_ ? "on" : "off");
 #else
     throw std::runtime_error("moe: DirectIOExpertStore is implemented for POSIX only");
@@ -240,15 +266,12 @@ IoUringExpertStore::IoUringExpertStore(const std::string & path, unsigned queue_
 #ifndef _WIN32
     const size_t bs = device_logical_block_size(path);
     align_ = bs ? bs : 4096;
-    fd_ = open(path.c_str(), O_RDONLY | O_DIRECT);
-    if (fd_ >= 0) {
-        direct_ = true;
-    } else {
-        fd_ = open(path.c_str(), O_RDONLY);
-        if (fd_ < 0) {
-            throw std::runtime_error("moe: cannot open model file for expert reads: " + path);
-        }
-        fprintf(stderr, "moe: O_DIRECT is not available for %s, io_uring store falls back to buffered reads\n", path.c_str());
+    fd_ = open_uncached(path, direct_);
+    if (fd_ < 0) {
+        throw std::runtime_error("moe: cannot open model file for expert reads: " + path);
+    }
+    if (!direct_) {
+        fprintf(stderr, "moe: " MOE_UNCACHED_NAME " is not available for %s, io_uring store falls back to buffered reads\n", path.c_str());
     }
 #ifdef LLAMA_MOE_IO_URING
     auto * ring = new io_uring();
@@ -263,7 +286,7 @@ IoUringExpertStore::IoUringExpertStore(const std::string & path, unsigned queue_
     fprintf(stderr, "moe: built without liburing, io_uring store falls back to pread\n");
 #endif
     name_ = std::string(ring_ok_ ? "uring" : "uring(fallback:pread)") + (direct_ ? "" : "(buffered)");
-    fprintf(stderr, "moe: io_uring store on %s, alignment %zu bytes, O_DIRECT %s, ring %s (depth %u)\n",
+    fprintf(stderr, "moe: io_uring store on %s, alignment %zu bytes, " MOE_UNCACHED_NAME " %s, ring %s (depth %u)\n",
             path.c_str(), align_, direct_ ? "on" : "off", ring_ok_ ? "on" : "off", depth_);
 #else
     throw std::runtime_error("moe: IoUringExpertStore is implemented for Linux only");
