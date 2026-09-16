@@ -2037,9 +2037,6 @@ void llm_graph_context::build_moe_prerouter(ggml_tensor * router_inp, int il, ll
     ggml_tensor * pids = ggml_argsort_top_k(ctx0, pl, k); // [k, n_tokens]
     cb(pids, "ffn_moe_prefetch_ids", il);
     ggml_build_forward_expand(gf, pids);
-    ggml_tensor * pval = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, pl, 1, pl->ne[0], pl->ne[1]), pids);
-    cb(pval, "ffn_moe_prefetch_probs", il);
-    ggml_build_forward_expand(gf, pval);
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(

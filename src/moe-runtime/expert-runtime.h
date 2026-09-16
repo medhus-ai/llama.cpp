@@ -73,26 +73,6 @@ public:
     const char * name() const override { return "memory"; }
 };
 
-// Reads expert bytes straight from the model file with positional reads (no mmap, no page-cache hints).
-// Requires TensorSlice::file_offset to be the absolute offset of the expert's bytes in the file.
-class BufferedFileExpertStore : public ExpertStore {
-public:
-    explicit BufferedFileExpertStore(const std::string & path);
-    ~BufferedFileExpertStore() override;
-
-    void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
-    const char * name() const override { return "file"; }
-
-    uint64_t reads() const { return reads_.load(); }
-    uint64_t bytes() const { return bytes_.load(); }
-
-private:
-    std::string path_;
-    int         fd_ = -1;
-    std::atomic<uint64_t> reads_{0};
-    std::atomic<uint64_t> bytes_{0};
-};
-
 // Reads expert bytes with O_DIRECT, bypassing the page cache. GGUF expert slabs are not block-aligned,
 // so each read covers the aligned range containing the slice and the wanted bytes are copied out of it
 // (see moe-stream-lab/docs/decisions/0004-direct-io-before-moepack.md). Falls back to buffered reads,
@@ -173,31 +153,6 @@ private:
     std::atomic<uint64_t> reads_{0};
     std::atomic<uint64_t> bytes_read_{0};
     std::atomic<uint64_t> bytes_used_{0};
-};
-
-// Reads expert bytes from a moepack sidecar (tools/moe-pack): every expert is one contiguous, aligned
-// bundle, so a whole expert is fetched with a single O_DIRECT read instead of one unaligned read per
-// tensor. TensorSlice::file_offset must point into the pack (set by the adapter from the .moeidx).
-// Implemented on top of DirectIOExpertStore's aligned cover-range reader; read_bundle() fetches all
-// slices of an expert at once when they are adjacent in the pack.
-class PackExpertStore : public ExpertStore {
-public:
-    explicit PackExpertStore(const std::string & pack_path, bool direct = true);
-
-    void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
-    const char * name() const override { return direct_ ? "pack(direct)" : "pack(buffered)"; }
-
-    // Whole-bundle fetch: slices must be adjacent (slice i+1 offset == slice i offset + bytes).
-    // dsts[i] receives slice i. Falls back to per-slice reads if not adjacent.
-    void read_bundle(const ExpertDescriptor & e, const std::vector<void *> & dsts);
-
-    uint64_t reads() const { return inner_->reads(); }
-    uint64_t bytes_read() const { return inner_->bytes_read(); }
-    uint64_t bytes_used() const { return inner_->bytes_used(); }
-
-private:
-    std::unique_ptr<DirectIOExpertStore> inner_;
-    bool direct_ = true;
 };
 
 // Host tier (moe-stream-lab ADR 0008): a bounded cache of whole expert bundles in RAM in front of any store.
@@ -331,18 +286,11 @@ struct PoolStats {
 
 // A compact pool of `n_slots`, backed by pool tensors (one per slice kind) whose ne[2] == n_slots.
 // The pool does not know what the tensors mean; it only copies bytes.
-//
-// `layer == ANY_LAYER` makes the pool shared by every MoE layer, which needs all of them to have
-// identically shaped and typed expert tensors. A shared pool uses capacity far better than per-layer
-// pools (see moe-stream-lab/docs/milestones/M2.md): at a 1 GB budget the simulator measured 34.4% hits
-// shared against 3.1% split per layer.
 class LayerPool {
 public:
-    static constexpr uint32_t ANY_LAYER = UINT32_MAX;
 
     LayerPool(uint32_t layer, uint32_t n_slots, std::vector<ggml_tensor *> pool_tensors);
 
-    bool is_shared() const { return layer_ == ANY_LAYER; }
 
     // Make every key in `keys` resident; returns slot ids in the same order. Aborts if the distinct set
     // exceeds n_slots (no silent fallback). All keys must belong to this layer.

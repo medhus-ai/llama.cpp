@@ -1696,11 +1696,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_pool_slots = params.moe_pool_slots;
     mparams.moe_store      = params.moe_store;
     mparams.moe_verify     = params.moe_verify;
-    mparams.moe_pool_shared = params.moe_pool_shared;
     mparams.moe_io_threads  = params.moe_io_threads;
-    mparams.moe_pack_path   = params.moe_pack_path.empty() ? nullptr : params.moe_pack_path.c_str();
     mparams.moe_host_cache_bytes = params.moe_host_cache_bytes;
-    mparams.moe_tier_state  = params.moe_tier_state.empty() ? nullptr : params.moe_tier_state.c_str();
     mparams.moe_sync_io     = params.moe_sync_io;
     mparams.moe_prefetch_k  = params.moe_prefetch_k;
     if (params.moe_pool_slots > 0 && params.moe_host_cache_bytes > 0 && params.moe_prefetch_k == 0) {
@@ -1712,9 +1709,6 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     if (mparams.moe_prefetch_k < 0) {
         mparams.moe_prefetch_k = 0;
     }
-    mparams.moe_prefetch_lookahead = params.moe_prefetch_lookahead;
-    mparams.moe_prefetch_src = params.moe_prefetch_src.empty() ? nullptr : params.moe_prefetch_src.c_str();
-    mparams.moe_prefetch_margin = params.moe_prefetch_margin;
     if (params.moe_pool_slots > 0 && !params.no_extra_bufts) {
         // moe-stream-lab: repacked expert weights live in a buffer type that cannot be read back
         // (no get_tensor), and the pool has to copy expert bytes out of them.

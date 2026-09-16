@@ -4540,28 +4540,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_prefetch_k = value;
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH"));
-    add_opt(common_arg(
-        {"--moe-prefetch-margin"}, "M",
-        "moe-stream-lab: only prefetch candidates whose router probability is within M (0..1) of the 6th-best; 0 = fixed top-K",
-        [](common_params & params, const std::string & value) {
-            params.moe_prefetch_margin = std::stof(value);
-        }
-    ));
-    add_opt(common_arg(
-        {"--moe-prefetch-lookahead"}, "N",
-        "moe-stream-lab: how many MoE layers ahead the prerouter predicts (default 1)",
-        [](common_params & params, int value) {
-            params.moe_prefetch_lookahead = value;
-        }
-    ));
-    add_opt(common_arg(
-        {"--moe-prefetch-src"}, "NAME",
-        "moe-stream-lab: use the CPU prerouter on this tensor prefix (e.g. attn_norm) instead of the in-graph router nodes (A/B)",
-        [](common_params & params, const std::string & value) {
-            params.moe_prefetch_src = value;
-        }
-    ));
-    add_opt(common_arg(
+                add_opt(common_arg(
         {"--moe-sync-io"},
         "moe-stream-lab: copy experts to the device synchronously instead of on a dedicated transfer stream (A/B)",
         [](common_params & params) {
@@ -4586,35 +4565,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_host_cache_bytes = (uint64_t) (v * (double) mult);
         }
     ).set_env("LLAMA_ARG_MOE_HOST_CACHE"));
-    add_opt(common_arg(
-        {"--moe-tier-state"}, "FNAME",
-        "moe-stream-lab: save the host tier's resident experts to FNAME on exit and read them back in the background on the next start, so a restarted server is warm from the first token (needs --moe-host-cache)",
-        [](common_params & params, const std::string & value) {
-            params.moe_tier_state = value;
-        }
-    ).set_env("LLAMA_ARG_MOE_TIER_STATE"));
-    add_opt(common_arg(
-        {"--moe-pack"}, "FNAME",
-        "moe-stream-lab: moepack sidecar to read experts from with --moe-store pack (default: <model>.moepack)",
-        [](common_params & params, const std::string & value) {
-            params.moe_pack_path = value;
-        }
-    ).set_env("LLAMA_ARG_MOE_PACK"));
-    add_opt(common_arg(
+            add_opt(common_arg(
         {"--moe-io-threads"}, "N",
         "moe-stream-lab: number of workers fetching the missing experts of one ubatch (default 1 = sequential, for A/B)",
         [](common_params & params, int value) {
             params.moe_io_threads = value;
         }
     ).set_env("LLAMA_ARG_MOE_IO_THREADS"));
-    add_opt(common_arg(
-        {"--moe-pool-shared"},
-        "moe-stream-lab: share one expert pool across all MoE layers (--moe-pool-slots then counts total slots) instead of one pool per layer",
-        [](common_params & params) {
-            params.moe_pool_shared = true;
-        }
-    ).set_env("LLAMA_ARG_MOE_POOL_SHARED"));
-    add_opt(common_arg(
+        add_opt(common_arg(
         {"--moe-verify"},
         "moe-stream-lab: byte-compare every expert read against the resident tensors (slow, correctness only)",
         [](common_params & params) {
@@ -4623,17 +4581,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_VERIFY"));
     add_opt(common_arg(
         {"--moe-store"}, "MODE",
-        "moe-stream-lab: where the expert pool gets its bytes (uring = O_DIRECT through io_uring, one submit per ubatch):\n"
-        "- memory: resident tensors (default)\n"
-        "- file: positional reads from the model file (page cache applies)\n"
+        "moe-stream-lab: where the expert pool gets its bytes:\n"
+        "- memory: resident tensors (default; the reference for --moe-verify)\n"
         "- direct: O_DIRECT reads from the model file, bypassing the page cache\n"
-        "- pack: O_DIRECT reads of whole expert bundles from the moepack sidecar (see --moe-pack)",
+        "- uring: O_DIRECT through io_uring, one submit per ubatch (recommended on CPU)",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "memory") { params.moe_store = 0; }
-            else if (value == "file")   { params.moe_store = 1; }
-            else if (value == "direct") { params.moe_store = 2; }
-            else if (value == "pack")   { params.moe_store = 3; }
-            else if (value == "uring")  { params.moe_store = 4; }
+            else if (value == "direct") { params.moe_store = 1; }
+            else if (value == "uring")  { params.moe_store = 2; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_MOE_STORE"));
