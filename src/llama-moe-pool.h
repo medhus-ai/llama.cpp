@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <thread>
 #include <string>
 #include <vector>
@@ -24,7 +25,7 @@ struct ggml_context;
 struct llama_moe_pool {
     // store_mode: 0 = resident tensors (memory), 1 = positional reads from the model file
     llama_moe_pool(llama_model & model, int32_t n_slots, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads, const std::string & pack_path, uint64_t host_cache_bytes,
-                   int32_t prefetch_k, int32_t prefetch_lookahead, const char * prefetch_src);
+                   int32_t prefetch_k, int32_t prefetch_lookahead, const char * prefetch_src, const char * tier_state);
     ~llama_moe_pool();
 
     llama_moe_pool(const llama_moe_pool &) = delete;
@@ -75,6 +76,14 @@ struct llama_moe_pool {
     std::vector<int32_t> pending_ids_;   // ids seen, waiting for their probs tensor (same callback batch)
     uint32_t pending_layer_ = UINT32_MAX; bool pending_entry_ = false; int64_t pending_ntok_ = 0;
     bool prerouter_in_graph_ = true;
+
+    // tier warm-start: the resident set is written to tier_state_path_ on exit and read back on the next start
+    std::string       tier_state_path_;
+    std::thread       warm_thread_;
+    std::atomic<bool> warm_stop_{false};
+    uint64_t          warm_requested_ = 0, warm_loaded_ = 0;
+    void warm_start();
+    void save_tier_state();
 
     bool    shared_ = false;
 
