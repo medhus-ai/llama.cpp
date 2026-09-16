@@ -1085,3 +1085,45 @@ def test_anthropic_thinking_with_reasoning_model(stream):
         # should also have text block
         text_blocks = [b for b in content if b.get("type") == "text"]
         assert len(text_blocks) > 0, "Should have text content block"
+
+
+# A chat template that rejects a system message anywhere but the first position,
+# as Qwen3 and several other templates do.
+STRICT_SYSTEM_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{%- if message['role'] == 'system' and not loop.first %}"
+    "{{- raise_exception('System message must be at the beginning.') }}"
+    "{%- endif %}"
+    "{{- '<|' + message['role'] + '|>' }}"
+    "{%- endfor %}"
+    "{{- '<|assistant|>' }}"
+)
+
+
+def test_anthropic_messages_system_after_first_turn(tmp_path):
+    """A system message after the first turn must not reach the template as one.
+
+    Clients of the beta messages endpoint may place a "system" message after the
+    opening user turn (Claude Code sends a trailing system-reminder this way).
+    Passing it through unchanged makes every request fail against templates that
+    require the system message to come first.
+    """
+    template = tmp_path / "strict_system.jinja"
+    template.write_text(STRICT_SYSTEM_TEMPLATE)
+
+    server.jinja = True
+    server.chat_template_file = str(template)
+    server.start()
+
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "Say hello"},
+            {"role": "system", "content": "<system-reminder>be brief</system-reminder>"},
+        ],
+    })
+
+    assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.body}"
+    assert res.body["type"] == "message"
+    assert res.body["role"] == "assistant"
