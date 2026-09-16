@@ -1,8 +1,8 @@
 name: ssd-moe macOS (Apple Silicon, Metal)
 
 # Build check for the moe-stream-lab expert runtime on Apple Silicon. Upstream workflows only run on master,
-# so this is the only CI that runs on the feature branch. It proves the code compiles and the pool's unit tests
-# pass; it does not run a model (hosted runners lack the RAM and disk for a 19 GB GGUF).
+# so this is the only CI that runs on the feature branch. It builds, runs the unit tests, and streams a small
+# real MoE model through the expert pool on Apple Silicon (CPU and Metal), byte-verified.
 on:
   push:
     branches: [feature/ssd-moe]
@@ -37,3 +37,42 @@ jobs:
 
       - name: Binary carries the expert-runtime flags
         run: ./build/bin/llama-completion --help | grep -E -- '--moe-store|--moe-pool-slots'
+
+      # A real MoE model, small enough for a hosted runner: OLMoE-1B-7B (16 MoE layers, 64 experts,
+      # 3 tensors per expert). Proves the expert pool actually streams on Apple Silicon, not just that it links.
+      - name: Cache the test model
+        id: model
+        uses: actions/cache@v4
+        with:
+          path: olmoe-test.gguf
+          key: olmoe-1b-7b-i1-IQ1_S-v1
+
+      - name: Fetch the test model
+        if: steps.model.outputs.cache-hit != 'true'
+        run: |
+          curl -sL --fail -o olmoe-test.gguf \
+            https://huggingface.co/mradermacher/OLMoE-1B-7B-0924-Instruct-i1-GGUF/resolve/main/OLMoE-1B-7B-0924-Instruct.i1-IQ1_S.gguf
+          ls -l olmoe-test.gguf
+
+      # F_NOCACHE replaces O_DIRECT here; --moe-verify byte-compares every streamed expert against the
+      # resident tensor and aborts on the first differing byte.
+      - name: CPU - streamed experts are byte-exact (F_NOCACHE path)
+        run: |
+          ./build/bin/llama-completion -m olmoe-test.gguf -p "The capital of France is" -n 16 \
+            --temp 0 -s 42 -t 4 -ngl 0 -c 512 -ub 1 \
+            --moe-pool-slots 8 --moe-store direct --moe-verify -no-cnv --no-warmup 2>&1 | tee cpu-verify.log
+          grep -q "store = verify" cpu-verify.log
+
+      - name: CPU - pool output matches stock token for token
+        run: |
+          common="-m olmoe-test.gguf -p \"The capital of France is\" -n 24 --temp 0 -s 42 -t 4 -ngl 0 -c 512 -no-cnv --no-warmup"
+          eval ./build/bin/llama-completion $common > stock.txt
+          eval ./build/bin/llama-completion $common -ub 1 --moe-pool-slots 8 --moe-store direct --moe-io-threads 2 > pool.txt
+          diff stock.txt pool.txt && echo "identical"
+
+      - name: Metal - expert pool in unified memory, byte-exact
+        run: |
+          ./build/bin/llama-completion -m olmoe-test.gguf -p "The capital of France is" -n 16 \
+            --temp 0 -s 42 -ngl 99 -c 512 -ub 1 \
+            --moe-pool-slots 8 --moe-store direct --moe-verify -no-cnv --no-warmup 2>&1 | tee metal-verify.log
+          grep -q "moe pool: per-layer pool" metal-verify.log
