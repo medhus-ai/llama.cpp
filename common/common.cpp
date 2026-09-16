@@ -1701,6 +1701,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_io_threads  = params.moe_io_threads;
     mparams.moe_pack_path   = params.moe_pack_path.empty() ? nullptr : params.moe_pack_path.c_str();
     mparams.moe_host_cache_bytes = params.moe_host_cache_bytes;
+    mparams.moe_tier_state  = params.moe_tier_state.empty() ? nullptr : params.moe_tier_state.c_str();
     mparams.moe_sync_io     = params.moe_sync_io;
     mparams.moe_prefetch_k  = params.moe_prefetch_k;
     if (params.moe_pool_slots > 0 && params.moe_host_cache_bytes > 0 && params.moe_prefetch_k == 0) {

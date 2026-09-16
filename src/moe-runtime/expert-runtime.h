@@ -229,6 +229,8 @@ public:
     bool prefetch(const ExpertDescriptor & e);
     Stats    stats() const;
     uint64_t resident_bytes() const;
+    // resident experts, most recently used first
+    std::vector<ExpertKey> resident_keys() const;
     uint64_t capacity() const { return n_slots_ * bundle_bytes_; }
     ExpertStore & inner() { return *inner_; }
 

@@ -4587,6 +4587,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_HOST_CACHE"));
     add_opt(common_arg(
+        {"--moe-tier-state"}, "FNAME",
+        "moe-stream-lab: save the host tier's resident experts to FNAME on exit and read them back in the background on the next start, so a restarted server is warm from the first token (needs --moe-host-cache)",
+        [](common_params & params, const std::string & value) {
+            params.moe_tier_state = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_TIER_STATE"));
+    add_opt(common_arg(
         {"--moe-pack"}, "FNAME",
         "moe-stream-lab: moepack sidecar to read experts from with --moe-store pack (default: <model>.moepack)",
         [](common_params & params, const std::string & value) {

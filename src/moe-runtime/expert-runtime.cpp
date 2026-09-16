@@ -709,6 +709,17 @@ CachingExpertStore::Stats CachingExpertStore::stats() const {
     return stats_;
 }
 
+std::vector<ExpertKey> CachingExpertStore::resident_keys() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<ExpertKey> out;
+    for (int i = head_; i >= 0; i = slabs_[i].next) {
+        if (slabs_[i].state == St::READY) {
+            out.push_back(ExpertKey{ slabs_[i].layer, slabs_[i].expert });
+        }
+    }
+    return out;
+}
+
 uint64_t CachingExpertStore::resident_bytes() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return n_ready_ * bundle_bytes_;

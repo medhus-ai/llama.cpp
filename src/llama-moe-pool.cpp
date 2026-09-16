@@ -22,7 +22,7 @@ static const char * PREFETCH_ENTRY_IDS_PREFIX = "ffn_moe_prefetch_entry_ids-";
 static const char * PREFETCH_ENTRY_PROBS_PREFIX = "ffn_moe_prefetch_entry_probs-";
 
 llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t store_mode, const std::string & model_path, bool verify, bool shared, int32_t io_threads, const std::string & pack_path, uint64_t host_cache_bytes,
-                               int32_t prefetch_k, int32_t prefetch_lookahead, const char * prefetch_src)
+                               int32_t prefetch_k, int32_t prefetch_lookahead, const char * prefetch_src, const char * tier_state)
     : n_slots(n_slots_) {
     if (n_slots <= 0) {
         throw std::runtime_error("moe pool: n_slots must be > 0");
@@ -326,6 +326,10 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
             model.hparams.moe_prefetch_lookahead = prefetch_lookahead < 1 ? 1 : prefetch_lookahead;
         }
     }
+    if (host_cache_ && tier_state && tier_state[0]) {
+        tier_state_path_ = tier_state;
+        warm_start();
+    }
 
     const auto & d0 = index_.descs[0];
     fprintf(stderr, "moe pool: %s pool, %zu MoE layers, %d slots%s, %zu tensors/expert, %.2f MiB/expert, "
@@ -348,6 +352,11 @@ void llama_moe_pool::attach_compute_backend(ggml_backend_t compute) {
 }
 
 llama_moe_pool::~llama_moe_pool() {
+    warm_stop_ = true;
+    if (warm_thread_.joinable()) {
+        warm_thread_.join();
+    }
+    save_tier_state();
     {
         std::lock_guard<std::mutex> lock(prerouter_.mtx);
         prerouter_.stop = true;
@@ -735,4 +744,64 @@ void llama_moe_pool::on_slot_ids(struct ggml_tensor * t, uint32_t il) {
     }
     pools_[shared_ ? 0 : (size_t) ls]->ensure(index_, *store_, keys_buf_, slots_buf_, stats_, clock_);
     ggml_backend_tensor_set(t, slots_buf_.data(), 0, n * sizeof(int32_t));
+}
+
+// Read the saved resident set and prefetch it in the background, least recent first so the LRU order comes
+// back the way it was saved. Reads compete with nothing until the first prompt arrives.
+void llama_moe_pool::warm_start() {
+    FILE * f = fopen(tier_state_path_.c_str(), "r");
+    if (!f) {
+        fprintf(stderr, "moe tier: no state file at %s, starting cold (it is written on exit)\n", tier_state_path_.c_str());
+        return;
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> keys;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned layer = 0, expert = 0;
+        if (line[0] == '#' || sscanf(line, "%u %u", &layer, &expert) != 2) {
+            continue;
+        }
+        if (index_.layer_slot(layer) < 0 || expert >= index_.n_expert) {
+            continue; // a different model's file
+        }
+        keys.emplace_back(layer, expert);
+    }
+    fclose(f);
+    warm_requested_ = keys.size();
+    if (keys.empty()) {
+        return;
+    }
+    fprintf(stderr, "moe tier: warm-starting %zu experts from %s in the background\n", keys.size(), tier_state_path_.c_str());
+    warm_thread_ = std::thread([this, keys = std::move(keys)]() {
+        for (auto it = keys.rbegin(); it != keys.rend() && !warm_stop_; ++it) {
+            try {
+                if (host_cache_->prefetch(index_.get(moe::ExpertKey{ it->first, it->second }))) {
+                    warm_loaded_++;
+                }
+            } catch (...) {
+                // the demand path reads it itself if this fails
+            }
+        }
+    });
+}
+
+void llama_moe_pool::save_tier_state() {
+    if (!host_cache_ || tier_state_path_.empty()) {
+        return;
+    }
+    const auto keys = host_cache_->resident_keys();
+    const std::string tmp = tier_state_path_ + ".tmp";
+    FILE * f = fopen(tmp.c_str(), "w");
+    if (!f) {
+        fprintf(stderr, "moe tier: cannot write %s\n", tmp.c_str());
+        return;
+    }
+    fprintf(f, "# moe-tier-state v1: layer expert, most recently used first\n");
+    for (const auto & k : keys) {
+        fprintf(f, "%u %u\n", k.layer, k.expert);
+    }
+    fclose(f);
+    rename(tmp.c_str(), tier_state_path_.c_str());
+    fprintf(stderr, "moe tier: saved %zu resident experts to %s (warm-start loaded %llu of %llu)\n",
+            keys.size(), tier_state_path_.c_str(), (unsigned long long) warm_loaded_, (unsigned long long) warm_requested_);
 }
