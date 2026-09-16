@@ -54,51 +54,6 @@ void MemoryExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, voi
     ggml_backend_tensor_get(s.source, dst, s.offset, s.bytes);
 }
 
-BufferedFileExpertStore::BufferedFileExpertStore(const std::string & path) : path_(path) {
-#ifndef _WIN32
-    fd_ = open(path.c_str(), O_RDONLY);
-    if (fd_ < 0) {
-        throw std::runtime_error("moe: cannot open model file for expert reads: " + path);
-    }
-#else
-    throw std::runtime_error("moe: BufferedFileExpertStore is implemented for POSIX only");
-#endif
-}
-
-BufferedFileExpertStore::~BufferedFileExpertStore() {
-#ifndef _WIN32
-    if (fd_ >= 0) {
-        close(fd_);
-    }
-#endif
-}
-
-void BufferedFileExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
-#ifndef _WIN32
-    const TensorSlice & s = e.slices.at(slice);
-    if (s.file_offset == 0) {
-        throw std::runtime_error("moe: no file offset recorded for " + s.name);
-    }
-    uint8_t * out = (uint8_t *) dst;
-    uint64_t  off = s.file_offset;
-    uint64_t  rem = s.bytes;
-    while (rem > 0) {
-        const ssize_t n = pread(fd_, out, (size_t) rem, (off_t) off);
-        if (n <= 0) {
-            throw std::runtime_error("moe: short read for " + s.name + " at offset " + std::to_string(off));
-        }
-        out += n;
-        off += (uint64_t) n;
-        rem -= (uint64_t) n;
-        reads_.fetch_add(1, std::memory_order_relaxed);
-    }
-    bytes_.fetch_add(s.bytes, std::memory_order_relaxed);
-#else
-    (void) e; (void) slice; (void) dst;
-    throw std::runtime_error("moe: BufferedFileExpertStore is implemented for POSIX only");
-#endif
-}
-
 #ifndef _WIN32
 // Logical block size of the device holding `path`, or 0 if it cannot be determined.
 static size_t device_logical_block_size(const std::string & path) {
@@ -436,45 +391,6 @@ void IoUringExpertStore::read_batch(const std::vector<BatchRead> & reqs) {
     (void) reqs;
     throw std::runtime_error("moe: IoUringExpertStore is implemented for Linux only");
 #endif
-}
-
-PackExpertStore::PackExpertStore(const std::string & pack_path, bool direct) : direct_(direct) {
-    inner_ = std::make_unique<DirectIOExpertStore>(pack_path);
-    if (direct && !inner_->is_direct()) {
-        direct_ = false;
-    }
-}
-
-void PackExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, void * dst) {
-    inner_->read_slice(e, slice, dst);
-}
-
-void PackExpertStore::read_bundle(const ExpertDescriptor & e, const std::vector<void *> & dsts) {
-    if (dsts.size() != e.slices.size()) {
-        throw std::runtime_error("moe: read_bundle: destination count != slice count");
-    }
-    bool adjacent = true;
-    for (size_t i = 1; i < e.slices.size(); ++i) {
-        if (e.slices[i].file_offset != e.slices[i - 1].file_offset + e.slices[i - 1].bytes) {
-            adjacent = false;
-            break;
-        }
-    }
-    if (!adjacent || e.slices.empty()) {
-        for (size_t i = 0; i < e.slices.size(); ++i) {
-            inner_->read_slice(e, i, dsts[i]);
-        }
-        return;
-    }
-    // one read for the whole bundle, then scatter into the per-tensor destinations
-    std::vector<uint8_t> & tmp = [] () -> std::vector<uint8_t> & { thread_local std::vector<uint8_t> t; return t; }();
-    tmp.resize(e.total_bytes);
-    inner_->read_range(e.slices[0].file_offset, e.total_bytes, tmp.data(), "expert bundle");
-    uint64_t off = 0;
-    for (size_t i = 0; i < e.slices.size(); ++i) {
-        memcpy(dsts[i], tmp.data() + off, e.slices[i].bytes);
-        off += e.slices[i].bytes;
-    }
 }
 
 CachingExpertStore::CachingExpertStore(std::unique_ptr<ExpertStore> inner, uint64_t capacity_bytes, uint64_t bundle_bytes,
@@ -927,9 +843,7 @@ static void read_expert(ExpertStore & store, const ExpertDescriptor & d, std::ve
         dsts[i] = staging.data() + off;
         off += d.slices[i].bytes;
     }
-    if (auto * pack = dynamic_cast<PackExpertStore *>(&store)) {
-        pack->read_bundle(d, dsts);
-    } else if (auto * cache = dynamic_cast<CachingExpertStore *>(&store)) {
+    if (auto * cache = dynamic_cast<CachingExpertStore *>(&store)) {
         cache->read_bundle(d, dsts);
     } else {
         for (size_t i = 0; i < d.slices.size(); ++i) {
@@ -1180,7 +1094,7 @@ void LayerPool::ensure(const ExpertIndex & idx, ExpertStore & store, const std::
     std::vector<ExpertKey> distinct;
     distinct.reserve(keys.size());
     for (const auto & k : keys) {
-        if (layer_ != ANY_LAYER && k.layer != layer_) {
+        if (k.layer != layer_) {
             throw std::runtime_error("moe: key for layer " + std::to_string(k.layer) + " sent to pool of layer " + std::to_string(layer_));
         }
         if (std::find(distinct.begin(), distinct.end(), k) == distinct.end()) {
@@ -1188,8 +1102,7 @@ void LayerPool::ensure(const ExpertIndex & idx, ExpertStore & store, const std::
         }
     }
     if (distinct.size() > slots_.size()) {
-        const std::string who = layer_ == ANY_LAYER ? std::string("the shared expert pool")
-                                                    : ("layer " + std::to_string(layer_));
+        const std::string who = "layer " + std::to_string(layer_);
         fprintf(stderr, "moe: %s needs %zu distinct experts in one ubatch but the pool has %zu slots; "
                         "raise --moe-pool-slots or lower -ub\n", who.c_str(), distinct.size(), slots_.size());
         throw std::runtime_error("moe: expert working set exceeds pool size");

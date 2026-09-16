@@ -215,10 +215,6 @@ llama_model_nemotron_h::graph::graph(const llama_model & model, const llm_graph_
                 ggml_tensor * eids = ggml_argsort_top_k(ctx0, pe, ke);
                 cb(eids, "ffn_moe_prefetch_entry_ids", first);
                 ggml_build_forward_expand(gf, eids);
-                ggml_tensor * pe3 = ggml_reshape_3d(ctx0, pe, 1, pe->ne[0], pe->ne[1]);
-                ggml_tensor * ev = ggml_get_rows(ctx0, pe3, eids);
-                cb(ev, "ffn_moe_prefetch_entry_probs", first);
-                ggml_build_forward_expand(gf, ev);
             }
         }
         cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);

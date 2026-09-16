@@ -332,16 +332,10 @@ extern "C" {
         // moe-stream-lab: where routed expert bytes come from: 0 = resident tensors, 1 = model file
         int32_t moe_store;
         bool    moe_verify;   // moe-stream-lab: byte-compare every expert read against the resident tensors
-        bool    moe_pool_shared; // moe-stream-lab: one pool shared by all MoE layers instead of one per layer
         int32_t moe_io_threads;  // moe-stream-lab: workers fetching the misses of one ubatch (1 = sequential)
-        const char * moe_pack_path; // moe-stream-lab: moepack sidecar for moe_store == 3 (NULL = <model>.moepack)
         uint64_t moe_host_cache_bytes; // moe-stream-lab: RAM cache of expert bundles in front of storage (0 = off)
         bool     moe_sync_io;          // moe-stream-lab: force synchronous H2D copies (A/B against the async transfer stream)
         int32_t  moe_prefetch_k;       // moe-stream-lab: prerouter top-k candidates per token (0 = off)
-        int32_t  moe_prefetch_lookahead; // moe-stream-lab: how many MoE layers ahead the prerouter predicts
-        const char * moe_prefetch_src; // moe-stream-lab: normed-input tensor name prefix the prerouter reads (NULL = attn_norm)
-        float    moe_prefetch_margin;  // moe-stream-lab: confidence margin for prefetch candidates (0 = fixed top-k)
-        const char * moe_tier_state;   // moe-stream-lab: file the host tier's resident set is saved to on exit and warmed from on start (NULL = off)
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
