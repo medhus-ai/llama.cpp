@@ -529,6 +529,16 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         }
     }
 
+    // Claude Code (and other clients of the beta messages endpoint) may place a
+    // "system" message after the first turn, e.g. a trailing system-reminder. Most
+    // chat templates only accept a system message in the leading position and raise
+    // otherwise, so demote any later one to a user message, preserving its position.
+    for (size_t i = 1; i < oai_messages.size(); ++i) {
+        if (json_value(oai_messages[i], "role", std::string()) == "system") {
+            oai_messages[i]["role"] = "user";
+        }
+    }
+
     oai_body["messages"] = oai_messages;
 
     // Convert tools
