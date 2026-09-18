@@ -783,6 +783,18 @@ void FetchWorkers::wait() {
     }
 }
 
+// Small fetch batches do not pay for the worker pool: start() takes a mutex and wakes every
+// thread, and each task signals back. At decode the queue is ~3-15 bundles, so the dispatch can
+// cost more than the reads save. 0 disables the inline path.
+static size_t moe_inline_fetch_max() {
+    static const size_t v = [] {
+        const char * s = getenv("LLAMA_MOE_INLINE_FETCH");
+        const int n = s ? atoi(s) : 0;
+        return (size_t) (n > 0 ? n : 0);
+    }();
+    return v;
+}
+
 void FetchWorkers::run(size_t n, const std::function<void(size_t)> & fn) {
     start(n, fn);
     wait();
@@ -1014,6 +1026,28 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
 
     if (async_dev) {
         drain_transfers();                       // previous batch's copies are complete: release its slabs
+        const bool inline_small = work.size() <= moe_inline_fetch_max();
+        auto issue_copy = [&](size_t i) {
+            const ExpertDescriptor & d = idx.get(work[i].first);
+            const uint8_t * src = cache ? views[i] : staged[i].data();
+            uint64_t off = 0;
+            for (size_t k = 0; k < d.slices.size(); ++k) {
+                ggml_backend_tensor_set_async(transfer_, tensors_[k], src + off, (size_t) work[i].second * tensors_[k]->nb[2], d.slices[k].bytes);
+                off += d.slices[k].bytes;
+            }
+        };
+        if (inline_small) {
+            try {
+                for (size_t i = 0; i < work.size(); ++i) {
+                    task(i);
+                    issue_copy(i);
+                }
+            } catch (...) {
+                ggml_backend_synchronize(transfer_);
+                if (cache) { for (size_t i = 0; i < work.size(); ++i) { if (views[i]) cache->release_bundle(idx.get(work[i].first)); } }
+                throw;
+            }
+        } else {
         workers_->start(work.size(), task_notify);
         size_t issued = 0;
         try {
@@ -1044,6 +1078,7 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
             if (cache) { for (size_t i = 0; i < work.size(); ++i) { if (views[i]) cache->release_bundle(idx.get(work[i].first)); } }
             throw;
         }
+        }
         ggml_backend_event_record(event_, transfer_);
         ggml_backend_event_wait(compute_, event_);   // the graph's next nodes wait on the GPU, not the host
         event_pending_ = true;
@@ -1061,7 +1096,11 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
     }
 
     // no partial state is published on error: slots stay LOADING and the exception propagates
-    workers_->run(work.size(), task);
+    if (work.size() <= moe_inline_fetch_max()) {
+        for (size_t i = 0; i < work.size(); ++i) { task(i); }
+    } else {
+        workers_->run(work.size(), task);
+    }
 
     if (!host_pool_) {
         for (size_t i = 0; i < work.size(); ++i) {
