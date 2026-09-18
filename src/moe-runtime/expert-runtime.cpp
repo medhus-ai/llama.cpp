@@ -24,6 +24,17 @@
 #include <cstdio>
 #endif
 
+
+// A pool tensor holds one expert per slot. Weight tensors are 3D and index slots on ne[2];
+// per-expert vectors (Gemma 4's ffn_down_exps.scale) are 1-D and index slots on ne[0].
+static inline uint64_t moe_slot_stride(const ggml_tensor * t) {
+    return t->ne[2] > 1 ? t->nb[2] : t->nb[0];
+}
+
+static inline int64_t moe_slot_count(const ggml_tensor * t) {
+    return t->ne[2] > 1 ? t->ne[2] : t->ne[0];
+}
+
 namespace moe {
 
 int ExpertIndex::layer_slot(uint32_t layer) const {
@@ -109,21 +120,35 @@ static int open_uncached(const std::string & path, bool & direct) {
 }
 #endif
 
-DirectIOExpertStore::DirectIOExpertStore(const std::string & path) : path_(path) {
+DirectIOExpertStore::DirectIOExpertStore(const std::vector<std::string> & paths) : paths_(paths) {
 #ifndef _WIN32
-    const size_t bs = device_logical_block_size(path);
+    if (paths_.empty()) {
+        throw std::runtime_error("moe: DirectIOExpertStore needs at least one model path");
+    }
+    path_ = paths_[0];
+    const size_t bs = device_logical_block_size(path_);
     align_ = bs ? bs : 4096;
 
-    fd_ = open_uncached(path, direct_);
-    if (fd_ < 0) {
-        throw std::runtime_error("moe: cannot open model file for expert reads: " + path);
+    fds_.resize(paths_.size(), -1);
+    for (size_t i = 0; i < paths_.size(); ++i) {
+        bool direct = false;
+        fds_[i] = open_uncached(paths_[i], direct);
+        if (fds_[i] < 0) {
+            throw std::runtime_error("moe: cannot open model file for expert reads: " + paths_[i]);
+        }
+        if (i == 0) {
+            direct_ = direct;
+        }
+        if (!direct) {
+            fprintf(stderr, "moe: " MOE_UNCACHED_NAME " is not available for %s, falling back to buffered reads "
+                            "(measurements will include page-cache effects)\n", paths_[i].c_str());
+        }
     }
-    if (!direct_) {
-        fprintf(stderr, "moe: " MOE_UNCACHED_NAME " is not available for %s, falling back to buffered reads "
-                        "(measurements will include page-cache effects)\n", path.c_str());
-    }
-    fprintf(stderr, "moe: direct store on %s, alignment %zu bytes, " MOE_UNCACHED_NAME " %s\n",
-            path.c_str(), align_, direct_ ? "on" : "off");
+    fd_ = fds_[0];
+    const std::string extra = paths_.size() > 1
+        ? " (+" + std::to_string(paths_.size() - 1) + " more shards)" : std::string();
+    fprintf(stderr, "moe: direct store on %s%s, alignment %zu bytes, " MOE_UNCACHED_NAME " %s\n",
+            path_.c_str(), extra.c_str(), align_, direct_ ? "on" : "off");
 #else
     throw std::runtime_error("moe: DirectIOExpertStore is implemented for POSIX only");
 #endif
@@ -131,8 +156,10 @@ DirectIOExpertStore::DirectIOExpertStore(const std::string & path) : path_(path)
 
 DirectIOExpertStore::~DirectIOExpertStore() {
 #ifndef _WIN32
-    if (fd_ >= 0) {
-        close(fd_);
+    for (int fd : fds_) {
+        if (fd >= 0) {
+            close(fd);
+        }
     }
 #endif
 }
@@ -173,17 +200,21 @@ DirectIOExpertStore::staging & DirectIOExpertStore::tls_staging() {
     return st;
 }
 
-void DirectIOExpertStore::read_range(uint64_t file_offset, uint64_t bytes, void * dst, const char * what) {
+void DirectIOExpertStore::read_range(uint64_t file_offset, uint64_t bytes, void * dst, const char * what, uint16_t shard) {
 #ifndef _WIN32
     const uint64_t begin = (file_offset / align_) * align_;
     const uint64_t end   = ((file_offset + bytes + align_ - 1) / align_) * align_;
     const size_t   span  = (size_t) (end - begin);
     uint8_t * buf = tls_staging().get(span, align_);
+    if (shard >= fds_.size()) {
+        throw std::runtime_error(std::string("moe: slice names shard ") + std::to_string(shard) + " but the store has " + std::to_string(fds_.size()));
+    }
+    const int fd = fds_[shard];
 
     size_t   got = 0;
     uint64_t n_reads = 0;
     while (got < span) {
-        const ssize_t n = pread(fd_, buf + got, span - got, (off_t) (begin + got));
+        const ssize_t n = pread(fd, buf + got, span - got, (off_t) (begin + got));
         if (n < 0) {
             throw std::runtime_error(std::string("moe: read error for ") + what + " at offset " + std::to_string(begin + got));
         }
@@ -204,7 +235,7 @@ void DirectIOExpertStore::read_range(uint64_t file_offset, uint64_t bytes, void 
     bytes_read_.fetch_add(got, std::memory_order_relaxed);
     bytes_used_.fetch_add(bytes, std::memory_order_relaxed);
 #else
-    (void) file_offset; (void) bytes; (void) dst; (void) what;
+    (void) file_offset; (void) bytes; (void) dst; (void) what; (void) shard;
     throw std::runtime_error("moe: DirectIOExpertStore is implemented for POSIX only");
 #endif
 }
@@ -214,20 +245,32 @@ void DirectIOExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, v
     if (s.file_offset == 0) {
         throw std::runtime_error("moe: no file offset recorded for " + s.name);
     }
-    read_range(s.file_offset, s.bytes, dst, s.name.c_str());
+    read_range(s.file_offset, s.bytes, dst, s.name.c_str(), s.shard);
 }
 
-IoUringExpertStore::IoUringExpertStore(const std::string & path, unsigned queue_depth) : path_(path), depth_(queue_depth) {
+IoUringExpertStore::IoUringExpertStore(const std::vector<std::string> & paths, unsigned queue_depth) : paths_(paths), depth_(queue_depth) {
 #ifndef _WIN32
-    const size_t bs = device_logical_block_size(path);
+    if (paths_.empty()) {
+        throw std::runtime_error("moe: IoUringExpertStore needs at least one model path");
+    }
+    path_ = paths_[0];
+    const size_t bs = device_logical_block_size(path_);
     align_ = bs ? bs : 4096;
-    fd_ = open_uncached(path, direct_);
-    if (fd_ < 0) {
-        throw std::runtime_error("moe: cannot open model file for expert reads: " + path);
+    fds_.resize(paths_.size(), -1);
+    for (size_t i = 0; i < paths_.size(); ++i) {
+        bool direct = false;
+        fds_[i] = open_uncached(paths_[i], direct);
+        if (fds_[i] < 0) {
+            throw std::runtime_error("moe: cannot open model file for expert reads: " + paths_[i]);
+        }
+        if (i == 0) {
+            direct_ = direct;
+        }
+        if (!direct) {
+            fprintf(stderr, "moe: " MOE_UNCACHED_NAME " is not available for %s, io_uring store falls back to buffered reads\n", paths_[i].c_str());
+        }
     }
-    if (!direct_) {
-        fprintf(stderr, "moe: " MOE_UNCACHED_NAME " is not available for %s, io_uring store falls back to buffered reads\n", path.c_str());
-    }
+    fd_ = fds_[0];
 #ifdef LLAMA_MOE_IO_URING
     auto * ring = new io_uring();
     if (io_uring_queue_init(depth_, ring, 0) == 0) {
@@ -241,8 +284,10 @@ IoUringExpertStore::IoUringExpertStore(const std::string & path, unsigned queue_
     fprintf(stderr, "moe: built without liburing, io_uring store falls back to pread\n");
 #endif
     name_ = std::string(ring_ok_ ? "uring" : "uring(fallback:pread)") + (direct_ ? "" : "(buffered)");
-    fprintf(stderr, "moe: io_uring store on %s, alignment %zu bytes, " MOE_UNCACHED_NAME " %s, ring %s (depth %u)\n",
-            path.c_str(), align_, direct_ ? "on" : "off", ring_ok_ ? "on" : "off", depth_);
+    const std::string extra = paths_.size() > 1
+        ? " (+" + std::to_string(paths_.size() - 1) + " more shards)" : std::string();
+    fprintf(stderr, "moe: io_uring store on %s%s, alignment %zu bytes, " MOE_UNCACHED_NAME " %s, ring %s (depth %u)\n",
+            path_.c_str(), extra.c_str(), align_, direct_ ? "on" : "off", ring_ok_ ? "on" : "off", depth_);
 #else
     throw std::runtime_error("moe: IoUringExpertStore is implemented for Linux only");
 #endif
@@ -259,8 +304,10 @@ IoUringExpertStore::~IoUringExpertStore() {
     if (arena_) {
         free(arena_);
     }
-    if (fd_ >= 0) {
-        close(fd_);
+    for (int fd : fds_) {
+        if (fd >= 0) {
+            close(fd);
+        }
     }
 #endif
 }
@@ -270,7 +317,7 @@ void IoUringExpertStore::read_slice(const ExpertDescriptor & e, size_t slice, vo
     if (s.file_offset == 0) {
         throw std::runtime_error("moe: no file offset recorded for " + s.name);
     }
-    read_batch({ BatchRead{ s.file_offset, s.bytes, dst, s.name.c_str() } });
+    read_batch({ BatchRead{ s.file_offset, s.bytes, dst, s.name.c_str(), s.shard } });
 }
 
 void IoUringExpertStore::read_batch(const std::vector<BatchRead> & reqs) {
@@ -317,7 +364,7 @@ void IoUringExpertStore::read_batch(const std::vector<BatchRead> & reqs) {
             if (!sqe) {
                 return false;
             }
-            io_uring_prep_read(sqe, fd_, arena_ + spans[i].arena_off + got[i], (unsigned) (spans[i].span - got[i]),
+            io_uring_prep_read(sqe, fds_.at(reqs[i].shard), arena_ + spans[i].arena_off + got[i], (unsigned) (spans[i].span - got[i]),
                                (__u64) (spans[i].begin + got[i]));
             io_uring_sqe_set_data64(sqe, (__u64) i);
             pending++;
@@ -363,7 +410,7 @@ void IoUringExpertStore::read_batch(const std::vector<BatchRead> & reqs) {
         for (size_t i = 0; i < reqs.size(); ++i) {
             size_t g = 0;
             while (g < spans[i].span) {
-                const ssize_t n = pread(fd_, arena_ + spans[i].arena_off + g, spans[i].span - g, (off_t) (spans[i].begin + g));
+                const ssize_t n = pread(fds_.at(reqs[i].shard), arena_ + spans[i].arena_off + g, spans[i].span - g, (off_t) (spans[i].begin + g));
                 if (n < 0) {
                     throw std::runtime_error(std::string("moe: read error for ") + reqs[i].what);
                 }
@@ -681,8 +728,8 @@ std::string PoolStats::json() const {
 LayerPool::LayerPool(uint32_t layer, uint32_t n_slots, std::vector<ggml_tensor *> pool_tensors)
     : layer_(layer), slots_(n_slots), tensors_(std::move(pool_tensors)) {
     for (auto * t : tensors_) {
-        if (t->ne[2] != (int64_t) n_slots) {
-            throw std::runtime_error("moe: pool tensor ne[2] != n_slots");
+        if (moe_slot_count(t) != (int64_t) n_slots) {
+            throw std::runtime_error("moe: pool tensor slot axis != n_slots");
         }
         if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
             host_pool_ = false;
@@ -856,7 +903,7 @@ static void read_expert(ExpertStore & store, const ExpertDescriptor & d, std::ve
 void LayerPool::publish(const ExpertDescriptor & d, int slot, const std::vector<uint8_t> & staging) {
     uint64_t off = 0;
     for (size_t i = 0; i < d.slices.size(); ++i) {
-        ggml_backend_tensor_set(tensors_[i], staging.data() + off, (size_t) slot * tensors_[i]->nb[2], d.slices[i].bytes);
+        ggml_backend_tensor_set(tensors_[i], staging.data() + off, (size_t) slot * moe_slot_stride(tensors_[i]), d.slices[i].bytes);
         off += d.slices[i].bytes;
     }
 }
@@ -877,7 +924,7 @@ void LayerPool::load(const ExpertIndex & idx, ExpertStore & store, ExpertKey k, 
     s.generation++;
     for (size_t i = 0; i < d.slices.size(); ++i) {
         const TensorSlice & sl = d.slices[i];
-        const uint64_t slot_bytes = tensors_[i]->nb[2];
+        const uint64_t slot_bytes = moe_slot_stride(tensors_[i]);
         if (sl.bytes != slot_bytes) {
             throw std::runtime_error("moe: slice bytes (" + std::to_string(sl.bytes) + ") != pool slot bytes (" +
                                      std::to_string(slot_bytes) + ") for " + sl.name);
@@ -904,15 +951,15 @@ void LayerPool::load_many_uring(const ExpertIndex & idx, IoUringExpertStore & st
         sl.generation++;
         for (size_t k = 0; k < d.slices.size(); ++k) {
             const TensorSlice & s = d.slices[k];
-            if (s.bytes != (uint64_t) tensors_[k]->nb[2]) {
+            if (s.bytes != moe_slot_stride(tensors_[k])) {
                 throw std::runtime_error("moe: slice bytes != pool slot bytes for " + s.name);
             }
             if (s.file_offset == 0) {
                 throw std::runtime_error("moe: no file offset recorded for " + s.name);
             }
             // host pool: the slot's bytes live in host memory, read straight into them
-            uint8_t * dst = (uint8_t *) tensors_[k]->data + (size_t) w.second * tensors_[k]->nb[2];
-            reqs.push_back(BatchRead{ s.file_offset, s.bytes, dst, s.name.c_str() });
+            uint8_t * dst = (uint8_t *) tensors_[k]->data + (size_t) w.second * moe_slot_stride(tensors_[k]);
+            reqs.push_back(BatchRead{ s.file_offset, s.bytes, dst, s.name.c_str(), s.shard });
         }
         bytes += d.total_bytes;
     }
@@ -969,7 +1016,7 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
             throw std::runtime_error("moe: descriptor slice count != pool tensor count");
         }
         for (size_t k = 0; k < d.slices.size(); ++k) {
-            if (d.slices[k].bytes != (uint64_t) tensors_[k]->nb[2]) {
+            if (d.slices[k].bytes != moe_slot_stride(tensors_[k])) {
                 throw std::runtime_error("moe: slice bytes != pool slot bytes for " + d.slices[k].name);
             }
         }
@@ -1032,7 +1079,7 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
                 const uint8_t * src = cache ? views[i] : staged[i].data();
                 uint64_t off = 0;
                 for (size_t k = 0; k < d.slices.size(); ++k) {
-                    ggml_backend_tensor_set_async(transfer_, tensors_[k], src + off, (size_t) work[i].second * tensors_[k]->nb[2], d.slices[k].bytes);
+                    ggml_backend_tensor_set_async(transfer_, tensors_[k], src + off, (size_t) work[i].second * moe_slot_stride(tensors_[k]), d.slices[k].bytes);
                     off += d.slices[k].bytes;
                 }
                 issued++;
@@ -1069,7 +1116,7 @@ void LayerPool::load_many(const ExpertIndex & idx, ExpertStore & store,
             if (cache) {
                 uint64_t off = 0;
                 for (size_t k = 0; k < d.slices.size(); ++k) {
-                    ggml_backend_tensor_set(tensors_[k], views[i] + off, (size_t) work[i].second * tensors_[k]->nb[2], d.slices[k].bytes);
+                    ggml_backend_tensor_set(tensors_[k], views[i] + off, (size_t) work[i].second * moe_slot_stride(tensors_[k]), d.slices[k].bytes);
                     off += d.slices[k].bytes;
                 }
                 cache->release_bundle(d);

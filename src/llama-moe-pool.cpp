@@ -4,6 +4,9 @@
 #include "llama-model.h"
 
 #include "gguf.h"
+#include <map>
+#include "llama.h"
+#include <climits>
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -32,11 +35,20 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
     index_.n_expert = n_expert;
 
     // --- adapter: discover routed-expert tensors per layer (generic over llama_layer fields) ---
-    struct kind_t { const char * name; ggml_tensor * llama_layer::* field; };
+    // vec = a 1-D per-expert vector (one value per expert, expert on ne[0]) rather than a
+    // 3D weight tensor with the expert on ne[2]. Gemma 4 ships ffn_down_exps.scale this way.
+    struct kind_t { const char * name; ggml_tensor * llama_layer::* field; bool vec; };
+    // Architectures differ in how they store the routed experts: most keep gate and up apart,
+    // Gemma 4 fuses them into one ffn_gate_up_exps. The pool does not care - a descriptor holds
+    // any number of slices - so the fused tensor is simply another kind.
     const kind_t kinds[] = {
-        { "gate", &llama_layer::ffn_gate_exps },
-        { "up",   &llama_layer::ffn_up_exps   },
-        { "down", &llama_layer::ffn_down_exps },
+        { "gate",       &llama_layer::ffn_gate_exps      , false },
+        { "up",         &llama_layer::ffn_up_exps        , false },
+        { "gate_up",    &llama_layer::ffn_gate_up_exps   , false },
+        { "down",       &llama_layer::ffn_down_exps      , false },
+        { "gate_s",     &llama_layer::ffn_gate_exps_s    , true  },
+        { "up_s",       &llama_layer::ffn_up_exps_s      , true  },
+        { "down_s",     &llama_layer::ffn_down_exps_s    , true  },
     };
 
     size_t n_tensors = 0;
@@ -49,12 +61,8 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         if (!any) {
             continue;
         }
-        if (L.ffn_gate_up_exps) {
-            throw std::runtime_error("moe pool: merged gate_up expert tensors are not supported yet (layer " + std::to_string(il) + ")");
-        }
-        if (L.ffn_gate_exps_b || L.ffn_up_exps_b || L.ffn_down_exps_b ||
-            L.ffn_gate_exps_s || L.ffn_up_exps_s || L.ffn_down_exps_s) {
-            throw std::runtime_error("moe pool: per-expert bias/scale tensors are not supported yet (layer " + std::to_string(il) + ")");
+        if (L.ffn_gate_exps_b || L.ffn_up_exps_b || L.ffn_down_exps_b) {
+            throw std::runtime_error("moe pool: per-expert bias tensors are not supported yet (layer " + std::to_string(il) + ")");
         }
         index_.moe_layers.push_back(il);
         for (const auto & k : kinds) {
@@ -83,18 +91,64 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
 
     // When reading from the file, resolve every expert tensor's absolute offset from the GGUF metadata.
     // The index stays model-independent: it only records byte ranges.
-    gguf_context * meta = nullptr;
-    uint64_t       meta_data_offset = 0;
+    // A split GGUF keeps its tensors in sibling shards, so resolve every expert tensor to
+    // (shard, absolute offset) rather than assuming one file. Single-file models take the same
+    // path with one shard.
+    struct slice_loc { uint16_t shard; uint64_t offset; };
+    std::map<std::string, slice_loc> tensor_loc;
+    std::vector<std::string> shard_paths;
     if (store_mode >= 1) {
         if (model_path.empty()) {
-            throw std::runtime_error("moe pool: file store requested but the model path is unknown (split models are not supported yet)");
+            throw std::runtime_error("moe pool: file store requested but the model path is unknown");
         }
         gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
-        meta = gguf_init_from_file(model_path.c_str(), gp);
-        if (!meta) {
-            throw std::runtime_error("moe pool: cannot read GGUF metadata from " + model_path);
+
+        int32_t n_split = 1;
+        {
+            gguf_context * head = gguf_init_from_file(model_path.c_str(), gp);
+            if (!head) {
+                throw std::runtime_error("moe pool: cannot read GGUF metadata from " + model_path);
+            }
+            const int64_t kid = gguf_find_key(head, "split.count");
+            if (kid >= 0) {
+                n_split = (int32_t) gguf_get_val_u16(head, kid);
+            }
+            gguf_free(head);
         }
-        meta_data_offset = gguf_get_data_offset(meta);
+        if (n_split <= 1) {
+            shard_paths.push_back(model_path);
+        } else {
+            // derive the sibling paths from this one, the way the model loader does
+            std::vector<char> pre(PATH_MAX, 0), buf(PATH_MAX, 0);
+            int32_t this_no = 0;
+            for (int32_t i = 0; i < n_split; ++i) {
+                if (llama_split_prefix(pre.data(), pre.size(), model_path.c_str(), i, n_split) > 0) {
+                    this_no = i;
+                    break;
+                }
+            }
+            if (llama_split_prefix(pre.data(), pre.size(), model_path.c_str(), this_no, n_split) == 0) {
+                throw std::runtime_error("moe pool: cannot derive split prefix from " + model_path);
+            }
+            for (int32_t i = 0; i < n_split; ++i) {
+                llama_split_path(buf.data(), buf.size(), pre.data(), i, n_split);
+                shard_paths.emplace_back(buf.data());
+            }
+            LLAMA_LOG_INFO("moe pool: split model, %d shards from prefix %s\n", n_split, pre.data());
+        }
+
+        for (size_t sh = 0; sh < shard_paths.size(); ++sh) {
+            gguf_context * m = gguf_init_from_file(shard_paths[sh].c_str(), gp);
+            if (!m) {
+                throw std::runtime_error("moe pool: cannot read GGUF metadata from " + shard_paths[sh]);
+            }
+            const uint64_t base = gguf_get_data_offset(m);
+            for (int64_t ti = 0; ti < gguf_get_n_tensors(m); ++ti) {
+                tensor_loc[gguf_get_tensor_name(m, ti)] =
+                    slice_loc{ (uint16_t) sh, base + gguf_get_tensor_offset(m, ti) };
+            }
+            gguf_free(m);
+        }
     }
 
     ggml_backend_buffer_type_t buft = nullptr;
@@ -116,13 +170,14 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         const uint32_t il = index_.moe_layers[ls];
         auto & L = model.layers[il];
         std::vector<ggml_tensor *> pool_tensors;
-        std::vector<ggml_tensor *> sources;
+        std::vector<std::pair<ggml_tensor *, bool>> sources;   // tensor, is per-expert vector
         for (const auto & k : kinds) {
             ggml_tensor * src = L.*k.field;
             if (!src) {
                 continue;
             }
-            if (src->ne[2] != (int64_t) n_expert) {
+            const int64_t src_experts = k.vec ? src->ne[0] : src->ne[2];
+            if (src_experts != (int64_t) n_expert) {
                 throw std::runtime_error(std::string("moe pool: unexpected expert axis in ") + ggml_get_name(src));
             }
             if (!ggml_is_contiguous(src)) {
@@ -141,28 +196,33 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
             }
             buft = layer_buft;
             ggml_context * ctx_ = ctx_for(layer_buft);
-            ggml_tensor * pt = ggml_new_tensor_3d(ctx_, src->type, src->ne[0], src->ne[1], n_slots);
+            ggml_tensor * pt = k.vec
+                ? ggml_new_tensor_1d(ctx_, src->type, n_slots)
+                : ggml_new_tensor_3d(ctx_, src->type, src->ne[0], src->ne[1], n_slots);
             ggml_format_name(pt, "moe_pool.blk.%u.%s", il, k.name);
             pool_tensors.push_back(pt);
-            sources.push_back(src);
+            sources.emplace_back(src, k.vec);
         }
         // descriptors
         for (uint32_t e = 0; e < n_expert; ++e) {
             moe::ExpertDescriptor d;
             d.key = { il, e };
-            for (ggml_tensor * src : sources) {
+            for (const auto & [src, is_vec] : sources) {
+                // one expert's stride: a 3D weight advances by nb[2], a per-expert vector by one element
+                const uint64_t stride = is_vec ? (uint64_t) ggml_type_size(src->type) : src->nb[2];
                 moe::TensorSlice sl;
                 sl.name   = ggml_get_name(src);
                 sl.source = src;
-                sl.bytes  = src->nb[2];
-                sl.offset = (uint64_t) e * src->nb[2];
+                sl.bytes  = stride;
+                sl.offset = (uint64_t) e * stride;
                 sl.type   = src->type;
-                if (meta && store_mode != 3) {
-                    const int64_t ti = gguf_find_tensor(meta, sl.name.c_str());
-                    if (ti < 0) {
+                if (!tensor_loc.empty() && store_mode != 3) {
+                    const auto it = tensor_loc.find(sl.name);
+                    if (it == tensor_loc.end()) {
                         throw std::runtime_error("moe pool: tensor not found in GGUF: " + sl.name);
                     }
-                    sl.file_offset = meta_data_offset + gguf_get_tensor_offset(meta, ti) + sl.offset;
+                    sl.shard       = it->second.shard;
+                    sl.file_offset = it->second.offset + sl.offset;
                 }
                 d.total_bytes += sl.bytes;
                 d.slices.push_back(std::move(sl));
@@ -194,9 +254,6 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
         buft_names += (buft_names.empty() ? "" : "+") + std::string(ggml_backend_buft_name(bt));
     }
 
-    if (meta) {
-        gguf_free(meta);
-    }
 
     // moepack layout (tools/moe-pack/moe_pack.py): 4 KiB header, then for each MoE layer in ascending order,
     // for each expert, the slices in kind order (up, down, gate as present), each bundle padded to `align`.
@@ -205,8 +262,8 @@ llama_moe_pool::llama_moe_pool(llama_model & model, int32_t n_slots_, int32_t st
 
     switch (store_mode) {
         case 0:  store_ = std::make_unique<moe::MemoryExpertStore>();             break;
-        case 1:  store_ = std::make_unique<moe::DirectIOExpertStore>(model_path); break;
-        case 2:  store_ = std::make_unique<moe::IoUringExpertStore>(model_path);  break;
+        case 1:  store_ = std::make_unique<moe::DirectIOExpertStore>(shard_paths); break;
+        case 2:  store_ = std::make_unique<moe::IoUringExpertStore>(shard_paths);  break;
         default: throw std::runtime_error("moe pool: unknown store mode " + std::to_string(store_mode));
     }
     if (host_cache_bytes > 0 && store_mode >= 1) {

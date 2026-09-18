@@ -32,7 +32,8 @@ struct ExpertKey {
 struct TensorSlice {
     std::string   name;         // source tensor name (e.g. blk.3.ffn_up_exps.weight)
     ggml_tensor * source = nullptr; // resident source tensor (MemoryExpertStore) or nullptr
-    uint64_t      file_offset = 0;  // absolute offset in the model file (file stores)
+    uint64_t      file_offset = 0;  // absolute offset inside shard `shard` (file stores)
+    uint16_t      shard  = 0;       // which model shard holds these bytes; 0 for a single-file GGUF
     uint64_t      offset = 0;       // byte offset of this expert inside the source tensor
     uint64_t      bytes  = 0;       // bytes of this expert's slice
     ggml_type     type   = GGML_TYPE_COUNT;
@@ -79,14 +80,15 @@ public:
 // with an explicit warning, when O_DIRECT is not available on the filesystem.
 class DirectIOExpertStore : public ExpertStore {
 public:
-    explicit DirectIOExpertStore(const std::string & path);
+    explicit DirectIOExpertStore(const std::string & path) : DirectIOExpertStore(std::vector<std::string>{path}) {}
+    explicit DirectIOExpertStore(const std::vector<std::string> & paths);
     ~DirectIOExpertStore() override;
 
     void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
     const char * name() const override { return direct_ ? "direct" : "direct(fallback:buffered)"; }
 
     // Read [file_offset, file_offset+bytes) into dst through the aligned staging buffer (thread-safe).
-    void read_range(uint64_t file_offset, uint64_t bytes, void * dst, const char * what);
+    void read_range(uint64_t file_offset, uint64_t bytes, void * dst, const char * what, uint16_t shard = 0);
 
     uint64_t reads() const { return reads_.load(); }
     uint64_t bytes_read() const { return bytes_read_.load(); }   // bytes actually pulled from the device
@@ -104,8 +106,10 @@ private:
     };
     static staging & tls_staging();
 
-    std::string path_;
-    int         fd_      = -1;
+    std::vector<std::string> paths_;
+    std::vector<int>         fds_;
+    std::string path_;              // shard 0, for log messages
+    int         fd_      = -1;      // shard 0
     bool        direct_  = false;
     size_t      align_   = 4096;
     std::atomic<uint64_t> reads_{0};
@@ -122,11 +126,14 @@ struct BatchRead {
     uint64_t bytes;
     void *   dst;
     const char * what;
+    uint16_t shard = 0;   // model shard holding these bytes
 };
 
 class IoUringExpertStore : public ExpertStore {
 public:
-    explicit IoUringExpertStore(const std::string & path, unsigned queue_depth = 64);
+    explicit IoUringExpertStore(const std::string & path, unsigned queue_depth = 64)
+        : IoUringExpertStore(std::vector<std::string>{path}, queue_depth) {}
+    explicit IoUringExpertStore(const std::vector<std::string> & paths, unsigned queue_depth = 64);
     ~IoUringExpertStore() override;
 
     void read_slice(const ExpertDescriptor & e, size_t slice, void * dst) override;
@@ -139,7 +146,9 @@ public:
     uint64_t bytes_used() const { return bytes_used_.load(); }
 
 private:
-    std::string path_;
+    std::vector<std::string> paths_;
+    std::vector<int>         fds_;
+    std::string path_;              // shard 0, for log messages
     std::string name_;
     int         fd_      = -1;
     bool        direct_  = false;
