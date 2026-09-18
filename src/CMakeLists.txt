@@ -38,6 +38,7 @@ set(LLAMA_CORE_SOURCES
     llama-model.cpp
     llama-moe-pool.cpp
     moe-runtime/expert-runtime.cpp
+    moe-runtime/expert-major.cpp
     llama-quant.cpp
     llama-sampler.cpp
     llama-vocab.cpp
