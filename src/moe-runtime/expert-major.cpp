@@ -27,8 +27,9 @@ ExpertMajorFFN::ExpertMajorFFN(ggml_backend_t backend, const ExpertDescriptor & 
     slice_gate_ = find_slice(proto, "ffn_gate_exps");
     slice_up_   = find_slice(proto, "ffn_up_exps");
     slice_down_ = find_slice(proto, "ffn_down_exps");
-    if (slice_up_ < 0 || slice_down_ < 0) {
-        throw std::runtime_error("moe: expert-major needs up and down slices");
+    slice_gate_up_ = find_slice(proto, "ffn_gate_up_exps");
+    if ((slice_up_ < 0 && slice_gate_up_ < 0) || slice_down_ < 0) {
+        throw std::runtime_error("moe: expert-major needs a down slice and either up or gate_up");
     }
     build_slots(proto);
 }
@@ -42,15 +43,20 @@ void ExpertMajorFFN::build_slots(const ExpertDescriptor & proto) {
     ggml_init_params ip = { ggml_tensor_overhead() * n_tensors, nullptr, /*no_alloc*/ true };
     ctx_ = ggml_init(ip);
 
-    const auto & su = proto.slices[slice_up_];
     const auto & sd = proto.slices[slice_down_];
 
-    w_up_.resize((size_t) wave_);
+    w_up_.assign((size_t) wave_, nullptr);
     w_down_.resize((size_t) wave_);
     w_gate_.assign((size_t) wave_, nullptr);
+    w_gate_up_.assign((size_t) wave_, nullptr);
     for (int64_t w = 0; w < wave_; ++w) {
-        w_up_[(size_t) w]   = ggml_new_tensor_2d(ctx_, su.type, n_embd_, n_ff_);
+        if (slice_up_ >= 0) {
+            w_up_[(size_t) w] = ggml_new_tensor_2d(ctx_, proto.slices[slice_up_].type, n_embd_, n_ff_);
+        }
         w_down_[(size_t) w] = ggml_new_tensor_2d(ctx_, sd.type, n_ff_,  n_embd_);
+        if (slice_gate_up_ >= 0) {
+            w_gate_up_[(size_t) w] = ggml_new_tensor_2d(ctx_, proto.slices[slice_gate_up_].type, n_embd_, 2 * n_ff_);
+        }
         if (slice_gate_ >= 0) {
             w_gate_[(size_t) w] = ggml_new_tensor_2d(ctx_, proto.slices[slice_gate_].type, n_embd_, n_ff_);
         }
@@ -66,7 +72,13 @@ void ExpertMajorFFN::build_slots(const ExpertDescriptor & proto) {
     // one chain of ~8 nodes per expert in a wave, plus slack
     graph_mem_.resize(ggml_tensor_overhead() * (size_t) (wave_ * 12 + 32) + ggml_graph_overhead_custom(wave_ * 12 + 32, false));
 
-    size_t widest = std::max(su.bytes, sd.bytes);
+    size_t widest = sd.bytes;
+    if (slice_up_ >= 0) {
+        widest = std::max(widest, proto.slices[slice_up_].bytes);
+    }
+    if (slice_gate_up_ >= 0) {
+        widest = std::max(widest, proto.slices[slice_gate_up_].bytes);
+    }
     if (slice_gate_ >= 0) {
         widest = std::max(widest, proto.slices[slice_gate_].bytes);
     }
@@ -162,6 +174,7 @@ size_t ExpertMajorFFN::run(ExpertStore & store, const ExpertIndex & index, uint3
                 ggml_backend_tensor_set(dst, staging_.data(), 0, sl.bytes);
                 bytes_fetched_ += sl.bytes;
             };
+            load(slice_gate_up_, w_gate_up_[w]);
             load(slice_gate_, w_gate_[w]);
             load(slice_up_,   w_up_[w]);
             load(slice_down_, w_down_[w]);
@@ -176,7 +189,19 @@ size_t ExpertMajorFFN::run(ExpertStore & store, const ExpertIndex & index, uint3
             ggml_tensor * gv = ggml_view_1d(gc, gidx_, m, (size_t) starts[w] * sizeof(int32_t));
             ggml_tensor * sv = ggml_view_1d(gc, sidx_, m, (size_t) starts[w] * sizeof(int64_t));
             ggml_tensor * x  = ggml_get_rows(gc, inp, gv);
-            ggml_tensor * h  = ggml_mul_mat(gc, w_up_[w], x);
+            ggml_tensor * h  = nullptr;
+            if (w_gate_up_[w]) {
+                // one GEMM, then split: gate = rows [0, n_ff), up = rows [n_ff, 2*n_ff)
+                ggml_tensor * gu = ggml_mul_mat(gc, w_gate_up_[w], x);   // [2*n_ff, m]
+                ggml_tensor * g  = ggml_view_2d(gc, gu, n_ff_, gu->ne[1], gu->nb[1], 0);
+                ggml_tensor * u  = ggml_view_2d(gc, gu, n_ff_, gu->ne[1], gu->nb[1], n_ff_ * gu->nb[0]);
+                h = ggml_mul(gc, ggml_silu(gc, g), u);
+                ggml_tensor * y0 = ggml_mul_mat(gc, w_down_[w], h);
+                ggml_build_forward_expand(gf, ggml_set_rows(gc, out, y0, sv));
+                ++visited;
+                continue;
+            }
+            h = ggml_mul_mat(gc, w_up_[w], x);
             if (w_gate_[w]) {
                 ggml_tensor * g = ggml_mul_mat(gc, w_gate_[w], x);
                 h = ggml_mul(gc, ggml_silu(gc, g), h);

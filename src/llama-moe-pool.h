@@ -8,6 +8,7 @@
 // MUL_MAT_ID nodes run. See moe-stream-lab/docs/decisions/0003-m3-compact-pool-mechanism.md.
 
 #include "moe-runtime/expert-runtime.h"
+#include "moe-runtime/expert-major.h"
 
 #include <cstdint>
 #include <condition_variable>
@@ -36,10 +37,39 @@ struct llama_moe_pool {
 
     std::string stats_json() const;
 
+    // --- expert-major prefill (ADR 0013) -------------------------------------------------------
+    // When on and a ubatch is at least em_min_tokens, build_moe_ffn skips the MUL_MAT_ID chain and
+    // emits a view of em_out(il) instead. The eval callback then computes that layer's FFN
+    // expert-major, visiting each expert once, so the chunk size stops depending on the pool.
+    bool          em_enabled   = false;
+    int32_t       em_min_tokens = 32;
+    // Use expert-major at or above the threshold, and also below it whenever the pool could not
+    // serve that ubatch token-major anyway (a remainder ubatch after a long prefill, for example).
+    // Without the second clause a 3-token remainder would fall back and abort on a small pool.
+    bool          em_active(int64_t n_tokens) const {
+        if (!em_enabled) { return false; }
+        return n_tokens >= em_min_tokens || n_tokens * em_n_used > (int64_t) n_slots;
+    }
+    int64_t       em_n_used = 0;
+    ggml_tensor * em_out(uint32_t il);                       // persistent [n_embd, n_used, n_ubatch]
+    void          em_register(uint32_t il, ggml_tensor * inp);  // FFN input for this layer, this graph
+    void          em_init(llama_model & model, uint32_t n_ubatch, int32_t wave);
+    uint64_t      em_layers_run = 0, em_experts_visited = 0, em_bytes = 0;
+
     ggml_backend_sched_eval_callback user_cb = nullptr;
     void *                           user_ud = nullptr;
 
     int32_t n_slots = 0;
+    struct em_layer_t {
+        ggml_tensor * out = nullptr;   // pool-owned output buffer (shared by every layer)
+        ggml_tensor * inp = nullptr;   // graph-owned FFN input, valid during execution
+    };
+    std::map<uint32_t, em_layer_t> em_;
+    // One engine for every layer: run() takes the layer, and only one layer computes at a time, so
+    // per-layer engines would duplicate the wave buffers (48 x 57 MiB on Qwen3.8).
+    std::unique_ptr<moe::ExpertMajorFFN> em_ffn_;
+    ggml_context *        em_ctx_ = nullptr;
+    ggml_backend_buffer_t em_buf_ = nullptr;
     // called by llama_context once it knows its backends; enables async H2D for device pools
     void attach_compute_backend(ggml_backend_t compute);
     ggml_backend_t transfer_backend_ = nullptr;   // owned; a second backend instance = its own stream

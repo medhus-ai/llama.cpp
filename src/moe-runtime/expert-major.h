@@ -63,6 +63,7 @@ private:
     ggml_gallocr_t        galloc_  = nullptr;
 
     // `wave_` resident experts: gate, up, down each. gate may be absent (ReLU^2 architectures).
+    std::vector<ggml_tensor *> w_gate_up_;   // fused gate+up (Gemma 4): [n_embd, 2*n_ff]
     std::vector<ggml_tensor *> w_gate_;
     std::vector<ggml_tensor *> w_up_;
     std::vector<ggml_tensor *> w_down_;
@@ -71,7 +72,7 @@ private:
     ggml_tensor * gidx_   = nullptr;   // I32 gather rows
     ggml_tensor * sidx_   = nullptr;   // I64 scatter rows
 
-    int slice_gate_ = -1, slice_up_ = -1, slice_down_ = -1;
+    int slice_gate_ = -1, slice_up_ = -1, slice_down_ = -1, slice_gate_up_ = -1;
 
     int64_t n_embd_ = 0, n_ff_ = 0, n_expert_ = 0, n_used_ = 0, max_rows_ = 0;
     act     act_    = act::silu;

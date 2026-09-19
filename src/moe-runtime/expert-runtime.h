@@ -33,10 +33,11 @@ struct TensorSlice {
     std::string   name;         // source tensor name (e.g. blk.3.ffn_up_exps.weight)
     ggml_tensor * source = nullptr; // resident source tensor (MemoryExpertStore) or nullptr
     uint64_t      file_offset = 0;  // absolute offset inside shard `shard` (file stores)
-    uint16_t      shard  = 0;       // which model shard holds these bytes; 0 for a single-file GGUF
     uint64_t      offset = 0;       // byte offset of this expert inside the source tensor
     uint64_t      bytes  = 0;       // bytes of this expert's slice
     ggml_type     type   = GGML_TYPE_COUNT;
+    // kept last so positional initialisation of the fields above keeps working
+    uint16_t      shard  = 0;       // which model shard holds these bytes; 0 for a single-file GGUF
 };
 
 // All bytes needed to execute one expert. Model-independent: any number of slices (gate/up/down/...).

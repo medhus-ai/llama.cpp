@@ -4600,6 +4600,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_POOL_SLOTS"));
     add_opt(common_arg(
+        {"--moe-expert-major"}, "N",
+        "moe-stream-lab: compute prefill expert-major for ubatches of at least N tokens (0 = off). "
+        "Visits each expert once per chunk instead of one MUL_MAT_ID over the pool, so the chunk size "
+        "stops depending on --moe-pool-slots",
+        [](common_params & params, int value) {
+            params.moe_expert_major = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_MAJOR"));
+    add_opt(common_arg(
         {"--moe-dump-dir"}, "DIR",
         "moe-stream-lab: dump the MoE layer outputs (ffn_moe_out) of the first ubatches to DIR for operator-level comparison",
         [](common_params & params, const std::string & value) {

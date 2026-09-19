@@ -519,6 +519,7 @@ struct common_params {
     // llama-debug specific options
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
     int32_t     moe_prefetch_k = 0;         // moe-stream-lab: prerouter candidates per token (0 = off)              // NOLINT
+    int32_t     moe_expert_major = 0;       // moe-stream-lab: expert-major prefill threshold in tokens (0 = off)     // NOLINT
     bool        moe_sync_io = false;        // moe-stream-lab: disable the async transfer stream (A/B)                 // NOLINT
     uint64_t    moe_host_cache_bytes = 0;   // moe-stream-lab: RAM cache of expert bundles (0 = off)                  // NOLINT
     int32_t     moe_io_threads = 1;         // moe-stream-lab: workers fetching the misses of one ubatch          // NOLINT

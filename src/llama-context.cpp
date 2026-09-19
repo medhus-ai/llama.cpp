@@ -255,9 +255,12 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
-    if (model.moe_pool) {
+    if (model.moe_pool && !model.moe_pool->em_enabled) {
         // moe-stream-lab: a ubatch may request up to n_expert_used distinct experts per token per layer, and
         // the pool must hold all of them at once (ADR 0007: split tokens, never the GEMM). Cap n_ubatch.
+        // Expert-major lifts exactly this constraint - it visits one expert at a time - so the cap is
+        // skipped when it is on. Decode ubatches below the threshold still run token-major, but they are
+        // one token and so always inside any cap.
         const uint32_t n_used = model.hparams.n_expert_used_max();
         const uint32_t cap    = n_used > 0 ? std::max<uint32_t>(1, (uint32_t) model.moe_pool->n_slots / n_used) : cparams.n_ubatch;
         if (cparams.n_ubatch > cap) {
@@ -385,6 +388,9 @@ llama_context::llama_context(
             for (auto & backend : backends) {
                 if (ggml_backend_get_device(backend.get()) == model.moe_pool->device_) {
                     model.moe_pool->attach_compute_backend(backend.get());
+                    if (model.moe_pool->em_enabled) {
+                        model.moe_pool->em_init(const_cast<llama_model &>(model), cparams.n_ubatch, 32);
+                    }
                     break;
                 }
             }

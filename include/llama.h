@@ -336,6 +336,7 @@ extern "C" {
         uint64_t moe_host_cache_bytes; // moe-stream-lab: RAM cache of expert bundles in front of storage (0 = off)
         bool     moe_sync_io;          // moe-stream-lab: force synchronous H2D copies (A/B against the async transfer stream)
         int32_t  moe_prefetch_k;       // moe-stream-lab: prerouter top-k candidates per token (0 = off)
+        int32_t  moe_expert_major;     // moe-stream-lab: expert-major prefill for ubatches >= this many tokens (0 = off)
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

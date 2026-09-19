@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-moe-pool.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -2228,6 +2229,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    // Expert-major prefill (ADR 0013): for a large enough chunk, skip the MUL_MAT_ID chain entirely
+    // and hand the layer to the pool, which visits each expert once and writes the same
+    // [n_embd, n_expert_used, n_tokens] result. Everything after this point - the weighting and the
+    // rank-order reduction - is unchanged, so the arithmetic per (rank, token) is identical.
+    llama_moe_pool * em_pool = nullptr;
+    if (moe_model && moe_model->moe_pool && moe_model->moe_pool->em_active(n_tokens)) {
+        em_pool = moe_model->moe_pool.get();
+    }
+    if (em_pool && em_pool->em_out(il)) {
+        ggml_tensor * dst = em_pool->em_out(il);
+        experts = ggml_view_3d(ctx0, dst, n_embd, n_expert_used, n_tokens,
+                               dst->nb[1], dst->nb[2], 0);
+        cb(experts, "ffn_moe_em_out", il);
+        // `cur` is [n_embd, 1, n_tokens] here: one FFN input per token, shared by its ranks
+        em_pool->em_register(il, cur);
+        ggml_build_forward_expand(gf, experts);
+    } else {
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, mm_ids, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
@@ -2374,6 +2392,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts = ggml_add_id(ctx0, experts, down_exps_b, mm_ids);
         cb(experts, "ffn_moe_down_biased", il);
     }
+
+    }   // end of the token-major chain
 
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);

@@ -334,7 +334,66 @@ void llama_moe_pool::attach_compute_backend(ggml_backend_t compute) {
     fprintf(stderr, "moe pool: async H2D on a dedicated transfer stream (%s)\n", ggml_backend_name(transfer_backend_));
 }
 
+
+// --- expert-major prefill (ADR 0013) ---------------------------------------------------------
+
+void llama_moe_pool::em_init(llama_model & model, uint32_t n_ubatch, int32_t wave) {
+    if (!em_enabled || index_.moe_layers.empty()) {
+        return;
+    }
+    const auto & hp = model.hparams;
+    const int64_t n_embd = hp.n_embd;
+    const int64_t n_used = hp.n_expert_used();
+    em_n_used = n_used;
+    const int64_t n_ff   = hp.n_ff_exp(index_.moe_layers.front());
+
+    ggml_init_params ip = { ggml_tensor_overhead() * (index_.moe_layers.size() + 4), nullptr, true };
+    em_ctx_ = ggml_init(ip);
+    // One buffer shared by every layer. Layer L+1's FFN depends on layer L's reduction, so only one
+    // layer's output is ever live; a buffer per layer would waste (n_layers - 1) copies of it -
+    // 2.5 GB on a 48-layer model, which is what made Qwen3.8 fail to fit.
+    ggml_backend_buffer_type_t buft = model.select_buft((int) index_.moe_layers.front());
+    ggml_tensor * shared = ggml_new_tensor_3d(em_ctx_, GGML_TYPE_F32, n_embd, n_used, n_ubatch);
+    ggml_set_name(shared, "moe_em_out.shared");
+    for (uint32_t il : index_.moe_layers) {
+        em_[il].out = shared;
+    }
+    em_buf_ = ggml_backend_alloc_ctx_tensors_from_buft(em_ctx_, buft);
+    if (!em_buf_) {
+        throw std::runtime_error("moe pool: cannot allocate the expert-major output buffer");
+    }
+    // one FFN engine per MoE layer; they share the store and the index
+    ggml_backend_t be = transfer_backend_ ? transfer_backend_ : nullptr;
+    if (!be && device_) {
+        be = ggml_backend_dev_init(device_, nullptr);
+    }
+    const auto act = (hp.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID)
+                   ? moe::ExpertMajorFFN::act::silu : moe::ExpertMajorFFN::act::silu;
+    const auto & proto = index_.get({ index_.moe_layers.front(), 0 });
+    em_ffn_ = std::make_unique<moe::ExpertMajorFFN>(
+        be, proto, n_embd, n_ff, (int64_t) index_.n_expert, n_used, act, wave);
+    LLAMA_LOG_INFO("moe expert-major: on for ubatches >= %d tokens, %zu layers, wave %d, shared out buffer %.1f MiB\n",
+                   em_min_tokens, index_.moe_layers.size(), wave,
+                   (double) ggml_backend_buffer_get_size(em_buf_) / 1024.0 / 1024.0);
+}
+
+ggml_tensor * llama_moe_pool::em_out(uint32_t il) {
+    auto it = em_.find(il);
+    return it == em_.end() ? nullptr : it->second.out;
+}
+
+void llama_moe_pool::em_register(uint32_t il, ggml_tensor * inp) {
+    auto it = em_.find(il);
+    if (it != em_.end()) {
+        it->second.inp = inp;
+    }
+}
+
 llama_moe_pool::~llama_moe_pool() {
+    em_ffn_.reset();
+    em_.clear();
+    if (em_buf_) { ggml_backend_buffer_free(em_buf_); }
+    if (em_ctx_) { ggml_free(em_ctx_); }
     {
         std::lock_guard<std::mutex> lock(prerouter_.mtx);
         prerouter_.stop = true;
@@ -550,6 +609,20 @@ void llama_moe_pool::on_slot_ids(struct ggml_tensor * t, uint32_t il) {
     // the tensor may be non-contiguous in theory; ggml_dup produces a contiguous result
     GGML_ASSERT(ggml_is_contiguous(t));
     ggml_backend_tensor_get(t, ids_buf_.data(), 0, n * sizeof(int32_t));
+
+    // Expert-major: the graph emitted a view of em_out(il) instead of the MUL_MAT_ID chain, so this
+    // layer's FFN is computed here, visiting each expert once. Nothing is loaded into slots.
+    if (em_active(n_tok)) {
+        auto it = em_.find(il);
+        if (it != em_.end() && em_ffn_ && it->second.inp) {
+            const size_t visited = em_ffn_->run(*store_, index_, il, ids_buf_.data(), n_tok,
+                                                it->second.inp, it->second.out);
+            em_layers_run++;
+            em_experts_visited += visited;
+            em_bytes = em_ffn_->bytes_fetched();
+            return;
+        }
+    }
 
     keys_buf_.resize(n);
     for (size_t i = 0; i < n; ++i) {
