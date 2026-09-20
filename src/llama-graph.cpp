@@ -2217,6 +2217,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // the router consumed this 2D input, so it is allocated in every graph; the 3D reshape below has
+    // no consumer under expert-major and would stay unallocated
+    ggml_tensor * em_inp = cur;
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2242,8 +2246,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts = ggml_view_3d(ctx0, dst, n_embd, n_expert_used, n_tokens,
                                dst->nb[1], dst->nb[2], 0);
         cb(experts, "ffn_moe_em_out", il);
-        // `cur` is [n_embd, 1, n_tokens] here: one FFN input per token, shared by its ranks
-        em_pool->em_register(il, cur);
+        // em_inp is [n_embd, n_tokens]: one FFN input per token, shared by its ranks. Nothing in
+        // the graph reads it past the router, so the allocator would hand its memory to the next
+        // node; the callback reads it after the top-k, so pin it for the whole graph.
+        GGML_ASSERT(!weight_before_ffn && "expert-major prefill needs the unweighted FFN input");
+        ggml_set_output(em_inp);
+        ggml_build_forward_expand(gf, em_inp);
+        em_pool->em_register(il, mm_ids, em_inp);
+        // The pool's callback fires on the slot-ids node. Token-major, the MUL_MAT_ID nodes pull it
+        // into the graph; here nothing else reads it, so expand it by hand or the callback never
+        // runs and the view below is read back unwritten.
+        ggml_build_forward_expand(gf, mm_ids);
         ggml_build_forward_expand(gf, experts);
     } else {
     if (gate_up_exps) {

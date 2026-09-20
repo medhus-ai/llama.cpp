@@ -184,6 +184,10 @@ public:
     const uint8_t * acquire_bundle(const ExpertDescriptor & e);
     void release_bundle(const ExpertDescriptor & e);
     bool pinned() const { return arena_buf_ != nullptr; }
+    // true when acquire_bundle(e) would hand out a pinned, DMA-able pointer
+    bool can_acquire(const ExpertDescriptor & e) const {
+        return n_slots_ > 0 && arena_buf_ != nullptr && e.total_bytes <= bundle_bytes_;
+    }
     const char * name() const override { return name_.c_str(); }
 
     struct Stats { uint64_t hits = 0, misses = 0, bytes_from_cache = 0, bytes_inserted = 0, evictions = 0;

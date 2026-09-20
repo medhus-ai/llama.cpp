@@ -10,6 +10,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include <cstdlib>
 
 #include <cstdio>
 #include <algorithm>
@@ -341,10 +342,25 @@ void llama_moe_pool::em_init(llama_model & model, uint32_t n_ubatch, int32_t wav
     if (!em_enabled || index_.moe_layers.empty()) {
         return;
     }
+    // every context sharing the model calls this (the MTP draft context too); keep the first
+    // buffer unless a later context needs a wider ubatch
+    if (em_buf_) {
+        ggml_tensor * shared = em_.begin()->second.out;
+        if (shared && shared->ne[2] >= (int64_t) n_ubatch) {
+            return;
+        }
+        em_ffn_.reset();
+        ggml_backend_buffer_free(em_buf_); em_buf_ = nullptr;
+        ggml_free(em_ctx_);               em_ctx_ = nullptr;
+    }
     const auto & hp = model.hparams;
     const int64_t n_embd = hp.n_embd;
     const int64_t n_used = hp.n_expert_used();
     em_n_used = n_used;
+    em_n_embd = n_embd;
+    em_n_ff   = hp.n_ff_exp(index_.moe_layers.front());
+    em_swiglu_clamp_.assign(hp.swiglu_clamp_exp.begin(), hp.swiglu_clamp_exp.end());
+    if (const char * e = getenv("LLAMA_MOE_EM_DEBUG")) { em_dbg_left = atoi(e) > 0 ? atoi(e) : 3; }
     const int64_t n_ff   = hp.n_ff_exp(index_.moe_layers.front());
 
     ggml_init_params ip = { ggml_tensor_overhead() * (index_.moe_layers.size() + 4), nullptr, true };
@@ -377,15 +393,59 @@ void llama_moe_pool::em_init(llama_model & model, uint32_t n_ubatch, int32_t wav
                    (double) ggml_backend_buffer_get_size(em_buf_) / 1024.0 / 1024.0);
 }
 
+// LLAMA_MOE_EM_DEBUG=N: recompute the first N expert-major layers on the CPU backend from the same
+// input and ids (the kernel is bit-exact against MUL_MAT_ID there) and report the deviation.
+void llama_moe_pool::em_debug_check(uint32_t il, int64_t n_tok, ggml_tensor * inp, ggml_tensor * out) {
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    const int64_t n_rows = em_n_used * n_tok;
+    ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * inp_c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, em_n_embd, n_tok);
+    ggml_tensor * out_c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, em_n_embd, n_rows);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+
+    std::vector<float> h_inp((size_t) em_n_embd * n_tok), h_out((size_t) em_n_embd * n_rows), h_ref(h_out.size());
+    ggml_backend_tensor_get(inp, h_inp.data(), 0, h_inp.size() * sizeof(float));
+    ggml_backend_tensor_get(out, h_out.data(), 0, h_out.size() * sizeof(float));
+    ggml_backend_tensor_set(inp_c, h_inp.data(), 0, h_inp.size() * sizeof(float));
+
+    const auto & proto = index_.get({ il, 0 });
+    moe::ExpertMajorFFN ref(cpu, proto, em_n_embd, em_n_ff, (int64_t) index_.n_expert, em_n_used,
+                            moe::ExpertMajorFFN::act::silu, 8);
+    ref.run(*store_, index_, il, ids_buf_.data(), n_tok, inp_c, out_c, il < em_swiglu_clamp_.size() ? em_swiglu_clamp_[il] : 0.0f);
+    ggml_backend_tensor_get(out_c, h_ref.data(), 0, h_ref.size() * sizeof(float));
+
+    double max_abs = 0, max_ref = 0, sum_sq_d = 0, sum_sq_r = 0; size_t n_nan = 0;
+    for (size_t i = 0; i < h_out.size(); ++i) {
+        if (!std::isfinite(h_out[i])) { n_nan++; continue; }
+        const double d = (double) h_out[i] - (double) h_ref[i];
+        max_abs = std::max(max_abs, std::fabs(d));
+        max_ref = std::max(max_ref, std::fabs((double) h_ref[i]));
+        sum_sq_d += d * d; sum_sq_r += (double) h_ref[i] * (double) h_ref[i];
+    }
+    double in_abs = 0; for (float v : h_inp) { in_abs = std::max(in_abs, std::fabs((double) v)); }
+    fprintf(stderr, "moe em-debug: layer %u, %lld tokens: max|dev-ref| %.3e, max|ref| %.3e, rel rms %.3e, nan %zu, max|inp| %.3e, out[0..3] %.4f %.4f %.4f ref %.4f %.4f %.4f\n",
+            il, (long long) n_tok, max_abs, max_ref, sum_sq_r > 0 ? std::sqrt(sum_sq_d / sum_sq_r) : 0.0, n_nan, in_abs,
+            h_out[0], h_out[1], h_out[2], h_ref[0], h_ref[1], h_ref[2]);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(cpu);
+}
+
 ggml_tensor * llama_moe_pool::em_out(uint32_t il) {
     auto it = em_.find(il);
     return it == em_.end() ? nullptr : it->second.out;
 }
 
-void llama_moe_pool::em_register(uint32_t il, ggml_tensor * inp) {
+void llama_moe_pool::em_register(uint32_t il, ggml_tensor * ids, ggml_tensor * inp) {
     auto it = em_.find(il);
     if (it != em_.end()) {
         it->second.inp = inp;
+        if (em_inp_by_ids_.size() > 65536) {
+            em_inp_by_ids_.clear();   // graph contexts recycle addresses; re-registration refreshes live ones
+        }
+        em_inp_by_ids_[ids] = inp;
     }
 }
 
@@ -420,6 +480,12 @@ llama_moe_pool::~llama_moe_pool() {
 
 std::string llama_moe_pool::stats_json() const {
     std::string out = stats_.json();
+    if (em_enabled) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), " expert_major: {\"layers_run\": %llu, \"experts_visited\": %llu, \"bytes\": %llu}",
+                 (unsigned long long) em_layers_run, (unsigned long long) em_experts_visited, (unsigned long long) em_bytes);
+        out += buf;
+    }
     if (host_cache_) {
         const auto hs = host_cache_->stats();
         char buf[320];
@@ -614,9 +680,19 @@ void llama_moe_pool::on_slot_ids(struct ggml_tensor * t, uint32_t il) {
     // layer's FFN is computed here, visiting each expert once. Nothing is loaded into slots.
     if (em_active(n_tok)) {
         auto it = em_.find(il);
-        if (it != em_.end() && em_ffn_ && it->second.inp) {
+        auto in = em_inp_by_ids_.find(t);
+        if (it != em_.end() && em_ffn_ && in != em_inp_by_ids_.end()) {
+            ggml_tensor * inp = in->second;
+            if (inp->data == nullptr) {
+                throw std::runtime_error("moe pool: expert-major input is not allocated in the executing graph");
+            }
+            const float limit = il < em_swiglu_clamp_.size() ? em_swiglu_clamp_[il] : 0.0f;
             const size_t visited = em_ffn_->run(*store_, index_, il, ids_buf_.data(), n_tok,
-                                                it->second.inp, it->second.out);
+                                                inp, it->second.out, limit);
+            if (em_dbg_left > 0) {
+                em_dbg_left--;
+                em_debug_check(il, n_tok, inp, it->second.out);
+            }
             em_layers_run++;
             em_experts_visited += visited;
             em_bytes = em_ffn_->bytes_fetched();

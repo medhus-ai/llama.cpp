@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <condition_variable>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <atomic>
@@ -50,10 +51,17 @@ struct llama_moe_pool {
         if (!em_enabled) { return false; }
         return n_tokens >= em_min_tokens || n_tokens * em_n_used > (int64_t) n_slots;
     }
-    int64_t       em_n_used = 0;
+    int64_t       em_n_used = 0, em_n_embd = 0, em_n_ff = 0;
+    std::vector<float> em_swiglu_clamp_;   // per layer, from hparams.swiglu_clamp_exp
+    int           em_dbg_left = 0;   // LLAMA_MOE_EM_DEBUG: layers still to cross-check against a CPU reference
     ggml_tensor * em_out(uint32_t il);                       // persistent [n_embd, n_used, n_ubatch]
-    void          em_register(uint32_t il, ggml_tensor * inp);  // FFN input for this layer, this graph
+    // FFN input for this layer, keyed by the slot-ids node of the same graph: the callback receives
+    // that node, so it finds the input of the graph that is actually executing. A per-layer slot
+    // would be overwritten by any graph built later (reserve graphs are built after compute ones).
+    void          em_register(uint32_t il, ggml_tensor * ids, ggml_tensor * inp);
+    std::unordered_map<ggml_tensor *, ggml_tensor *> em_inp_by_ids_;
     void          em_init(llama_model & model, uint32_t n_ubatch, int32_t wave);
+    void          em_debug_check(uint32_t il, int64_t n_tok, ggml_tensor * inp, ggml_tensor * out);
     uint64_t      em_layers_run = 0, em_experts_visited = 0, em_bytes = 0;
 
     ggml_backend_sched_eval_callback user_cb = nullptr;

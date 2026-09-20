@@ -17,7 +17,9 @@
 
 #include "expert-runtime.h"
 
+#include <array>
 #include <cstdint>
+#include <map>
 #include <vector>
 
 struct ggml_gallocr;
@@ -47,32 +49,47 @@ public:
     //      gather reads row p / n_expert_used while the scatter writes row p.
     // out: device [n_embd, n_expert_used * n_tokens], one row per (rank, token); caller reduces.
     // Returns the number of experts actually visited.
+    // swiglu_limit > 0 reproduces build_moe_ffn's clamped SwiGLU (hparams.swiglu_clamp_exp[il]).
     size_t run(ExpertStore & store, const ExpertIndex & index, uint32_t layer,
-               const int32_t * ids, int64_t n_tokens, ggml_tensor * inp, ggml_tensor * out);
+               const int32_t * ids, int64_t n_tokens, ggml_tensor * inp, ggml_tensor * out,
+               float swiglu_limit = 0.0f);
 
     uint64_t experts_visited() const { return experts_visited_; }
     uint64_t bytes_fetched()   const { return bytes_fetched_; }
     uint64_t launches()        const { return launches_; }
 
 private:
-    void build_slots(const ExpertDescriptor & proto);
-
     ggml_backend_t        backend_ = nullptr;
-    ggml_context *        ctx_     = nullptr;
+    ggml_context *        ctx_     = nullptr;   // index buffers
     ggml_backend_buffer_t buf_     = nullptr;
     ggml_gallocr_t        galloc_  = nullptr;
 
     // `wave_` resident experts: gate, up, down each. gate may be absent (ReLU^2 architectures).
-    std::vector<ggml_tensor *> w_gate_up_;   // fused gate+up (Gemma 4): [n_embd, 2*n_ff]
-    std::vector<ggml_tensor *> w_gate_;
-    std::vector<ggml_tensor *> w_up_;
-    std::vector<ggml_tensor *> w_down_;
+    // Dynamic quants (Unsloth UD) change the expert tensor types from layer to layer, so the slots
+    // are kept per type set and picked by the layer being run; a few sets of wave x 3 tensors.
+    struct slot_set {
+        ggml_context *        ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        std::vector<ggml_tensor *> gate_up;   // fused gate+up (Gemma 4): [n_embd, 2*n_ff]
+        std::vector<ggml_tensor *> gate;
+        std::vector<ggml_tensor *> up;
+        std::vector<ggml_tensor *> down;
+    };
+    using type_key = std::array<int, 4>;   // gate, up, gate_up, down types (GGML_TYPE_COUNT = absent)
+    std::map<type_key, slot_set> sets_;
+    slot_set & slots_for(const ExpertDescriptor & d);
+    void build_index_buffers();
     int64_t wave_ = 32;
     uint64_t launches_ = 0;
     ggml_tensor * gidx_   = nullptr;   // I32 gather rows
     ggml_tensor * sidx_   = nullptr;   // I64 scatter rows
 
     int slice_gate_ = -1, slice_up_ = -1, slice_down_ = -1, slice_gate_up_ = -1;
+    // per-expert f32 scales (dynamic quants such as Gemma 4 ship ffn_down_exps.scale); -1 when absent.
+    // Applied exactly as build_lora_mm_id does: the whole gate_up product by the up scale, the
+    // down product by the down scale.
+    int slice_gate_s_ = -1, slice_up_s_ = -1, slice_down_s_ = -1;
+    float read_scale(ExpertStore & store, const ExpertDescriptor & d, int slice);
 
     int64_t n_embd_ = 0, n_ff_ = 0, n_expert_ = 0, n_used_ = 0, max_rows_ = 0;
     act     act_    = act::silu;
