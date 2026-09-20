@@ -2238,7 +2238,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // [n_embd, n_expert_used, n_tokens] result. Everything after this point - the weighting and the
     // rank-order reduction - is unchanged, so the arithmetic per (rank, token) is identical.
     llama_moe_pool * em_pool = nullptr;
-    if (moe_model && moe_model->moe_pool && moe_model->moe_pool->em_active(n_tokens)) {
+    // the kernel implements gated SwiGLU and ungated ReLU^2; anything else stays token-major
+    const bool em_op_ok = !weight_before_ffn && !gate_up_exps_b && !up_exps_b && !gate_exps_b && !down_exps_b &&
+        ((type_op == LLM_FFN_SILU && (gate_exps || gate_up_exps)) || (type_op == LLM_FFN_RELU_SQR && !gate_exps && !gate_up_exps));
+    if (em_op_ok && moe_model && moe_model->moe_pool && moe_model->moe_pool->em_active(n_tokens)) {
         em_pool = moe_model->moe_pool.get();
     }
     if (em_pool && em_pool->em_out(il)) {
@@ -2252,7 +2255,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         GGML_ASSERT(!weight_before_ffn && "expert-major prefill needs the unweighted FFN input");
         ggml_set_output(em_inp);
         ggml_build_forward_expand(gf, em_inp);
-        em_pool->em_register(il, mm_ids, em_inp);
+        em_pool->em_register(il, mm_ids, em_inp, type_op == LLM_FFN_RELU_SQR);
         // The pool's callback fires on the slot-ids node. Token-major, the MUL_MAT_ID nodes pull it
         // into the graph; here nothing else reads it, so expand it by hand or the callback never
         // runs and the view below is read back unwritten.

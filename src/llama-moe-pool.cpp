@@ -354,14 +354,21 @@ void llama_moe_pool::em_init(llama_model & model, uint32_t n_ubatch, int32_t wav
         ggml_free(em_ctx_);               em_ctx_ = nullptr;
     }
     const auto & hp = model.hparams;
-    const int64_t n_embd = hp.n_embd;
+    const auto & L0 = model.layers[index_.moe_layers.front()];
+    ggml_tensor * t_up   = L0.ffn_gate_up_exps ? L0.ffn_gate_up_exps : L0.ffn_up_exps;
+    ggml_tensor * t_down = L0.ffn_down_exps;
+    if (!t_up || !t_down || t_up->ne[0] != t_down->ne[1]) {
+        throw std::runtime_error("moe pool: expert-major needs matching expert input and output widths");
+    }
+    // the experts' own width, which is a latent width on models that project around the MoE
+    const int64_t n_embd = t_up->ne[0];
+    const int64_t n_ff   = L0.ffn_gate_up_exps ? t_up->ne[1] / 2 : t_up->ne[1];
     const int64_t n_used = hp.n_expert_used();
     em_n_used = n_used;
     em_n_embd = n_embd;
-    em_n_ff   = hp.n_ff_exp(index_.moe_layers.front());
+    em_n_ff   = n_ff;
     em_swiglu_clamp_.assign(hp.swiglu_clamp_exp.begin(), hp.swiglu_clamp_exp.end());
     if (const char * e = getenv("LLAMA_MOE_EM_DEBUG")) { em_dbg_left = atoi(e) > 0 ? atoi(e) : 3; }
-    const int64_t n_ff   = hp.n_ff_exp(index_.moe_layers.front());
 
     ggml_init_params ip = { ggml_tensor_overhead() * (index_.moe_layers.size() + 4), nullptr, true };
     em_ctx_ = ggml_init(ip);
@@ -383,8 +390,7 @@ void llama_moe_pool::em_init(llama_model & model, uint32_t n_ubatch, int32_t wav
     if (!be && device_) {
         be = ggml_backend_dev_init(device_, nullptr);
     }
-    const auto act = (hp.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID)
-                   ? moe::ExpertMajorFFN::act::silu : moe::ExpertMajorFFN::act::silu;
+    const auto act = moe::ExpertMajorFFN::act::silu;   // per layer at run time, see em_register
     const auto & proto = index_.get({ index_.moe_layers.front(), 0 });
     em_ffn_ = std::make_unique<moe::ExpertMajorFFN>(
         be, proto, n_embd, n_ff, (int64_t) index_.n_expert, n_used, act, wave);
@@ -411,7 +417,7 @@ void llama_moe_pool::em_debug_check(uint32_t il, int64_t n_tok, ggml_tensor * in
 
     const auto & proto = index_.get({ il, 0 });
     moe::ExpertMajorFFN ref(cpu, proto, em_n_embd, em_n_ff, (int64_t) index_.n_expert, em_n_used,
-                            moe::ExpertMajorFFN::act::silu, 8);
+                            em_[il].relu_sqr ? moe::ExpertMajorFFN::act::relu_sqr : moe::ExpertMajorFFN::act::silu, 8);
     ref.run(*store_, index_, il, ids_buf_.data(), n_tok, inp_c, out_c, il < em_swiglu_clamp_.size() ? em_swiglu_clamp_[il] : 0.0f);
     ggml_backend_tensor_get(out_c, h_ref.data(), 0, h_ref.size() * sizeof(float));
 
@@ -438,10 +444,11 @@ ggml_tensor * llama_moe_pool::em_out(uint32_t il) {
     return it == em_.end() ? nullptr : it->second.out;
 }
 
-void llama_moe_pool::em_register(uint32_t il, ggml_tensor * ids, ggml_tensor * inp) {
+void llama_moe_pool::em_register(uint32_t il, ggml_tensor * ids, ggml_tensor * inp, bool relu_sqr) {
     auto it = em_.find(il);
     if (it != em_.end()) {
         it->second.inp = inp;
+        it->second.relu_sqr = relu_sqr;
         if (em_inp_by_ids_.size() > 65536) {
             em_inp_by_ids_.clear();   // graph contexts recycle addresses; re-registration refreshes live ones
         }
@@ -686,6 +693,10 @@ void llama_moe_pool::on_slot_ids(struct ggml_tensor * t, uint32_t il) {
             if (inp->data == nullptr) {
                 throw std::runtime_error("moe pool: expert-major input is not allocated in the executing graph");
             }
+            if (n_used != em_n_used) {
+                throw std::runtime_error("moe pool: expert-major needs the same expert count in every layer");
+            }
+            em_ffn_->set_act(it->second.relu_sqr ? moe::ExpertMajorFFN::act::relu_sqr : moe::ExpertMajorFFN::act::silu);
             const float limit = il < em_swiglu_clamp_.size() ? em_swiglu_clamp_[il] : 0.0f;
             const size_t visited = em_ffn_->run(*store_, index_, il, ids_buf_.data(), n_tok,
                                                 inp, it->second.out, limit);

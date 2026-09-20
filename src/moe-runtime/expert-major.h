@@ -54,6 +54,9 @@ public:
                const int32_t * ids, int64_t n_tokens, ggml_tensor * inp, ggml_tensor * out,
                float swiglu_limit = 0.0f);
 
+    // the FFN op is a property of the graph, not of the weights: set it before run()
+    void set_act(act a) { act_ = a; }
+
     uint64_t experts_visited() const { return experts_visited_; }
     uint64_t bytes_fetched()   const { return bytes_fetched_; }
     uint64_t launches()        const { return launches_; }

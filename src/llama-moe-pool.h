@@ -58,7 +58,7 @@ struct llama_moe_pool {
     // FFN input for this layer, keyed by the slot-ids node of the same graph: the callback receives
     // that node, so it finds the input of the graph that is actually executing. A per-layer slot
     // would be overwritten by any graph built later (reserve graphs are built after compute ones).
-    void          em_register(uint32_t il, ggml_tensor * ids, ggml_tensor * inp);
+    void          em_register(uint32_t il, ggml_tensor * ids, ggml_tensor * inp, bool relu_sqr);
     std::unordered_map<ggml_tensor *, ggml_tensor *> em_inp_by_ids_;
     void          em_init(llama_model & model, uint32_t n_ubatch, int32_t wave);
     void          em_debug_check(uint32_t il, int64_t n_tok, ggml_tensor * inp, ggml_tensor * out);
@@ -71,6 +71,7 @@ struct llama_moe_pool {
     struct em_layer_t {
         ggml_tensor * out = nullptr;   // pool-owned output buffer (shared by every layer)
         ggml_tensor * inp = nullptr;   // graph-owned FFN input, valid during execution
+        bool relu_sqr = false;         // ungated ReLU^2 experts (Nemotron-H) instead of SwiGLU
     };
     std::map<uint32_t, em_layer_t> em_;
     // One engine for every layer: run() takes the layer, and only one layer computes at a time, so
